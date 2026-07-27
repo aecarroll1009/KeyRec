@@ -1,0 +1,28 @@
+Project: reproduce a public acoustic-keystroke-recognition paper from scratch.
+	I'm rebuilding a personal ML project I designed elsewhere. I'm giving you the full design so you can rebuild the code from scratch. Do not ask me for the original files; there are none to give, we're re-implementing a public paper. The paper is "Harrison, Toreini, Mehrezhad 2023, A practical deep-learning based acoustic side channel attack on keyboards. (arXiv: 2308.01074). Everything uses only open source libs. Goal: record the sound of individual keypresses and train a neural net to classify which key was pressed. 
+
+The Concept:
+	I record one WAV file per key on my thinkpad using iPhone as the mic; each file is that one key pressed approx. 25 times with approx. one second gaps, and the filename is the label (a.wav, 5.wav, space.wav, etc.) 37 classes total: 0-9, a-z, and space. Pipeline; isolate each keystroke to convert to a mel spectrogram to train image classifier to evaluate. Build it as five python files. Build one file at a time, and after each file write a tiny synthetic data test and run it to prove it works before moving on. I'm on my personal machine with admin, so any pip install is fine. 
+
+File One: isolate_keystrokes.py (stdlib wave and numpy only, must run with no installs)
+	Reads raw/<label>.wav, finds each keystroke by a short time RMS energy envelope, and writes fixed 14400 sample clips to clips/<label>_NN.wav. Detection: threshold = median+k*MAD of the energy (robust stats), rising edge detection with a debounce (~350ns) of the wav header itself (stdlib wave crashes on 32 bit float WAV, which phones/ffmeg produce) and handle 8/16/24/32 bit PCM and float. include a CLI: --only<key>, --plot, --threshold-k, --min-gap-ms, --expected 25, and print OK/CHECK per file (detected vs expected count). 
+
+File Two: features.py (numpy required, librosa optional)
+	Reads the clips, makes 64x64 log mel-spectogram per clip (64 mel bands, FFT window 1024, hop 225 (or maybe 500 for the thinkpad's longer keystrokes compared to the MacBook used in their original demo), power_to_db referenced to max with an 80dB floor, then normalize each image to [0,1], saves X (N, 64, 64), Y, and label itself to a .npz. Include a pure numpy mel fallback for when librosa isn't installed but it MUST match librosa: use slaney filterbank normalization (scale each triangle by 2/(hz_hi, hz_lo)) AND center=True reflect-padding (pad n_fft/z on each side before framing). Pick the backend ONCE at import, not per clip. Also include augmentation features: zero-filled (not circular) time shift +/-40% and SpecAugment (mask, ~10% freq band, set to image mean, 2 masks/axis).
+
+File Three: model.py (torch, lazily imported)
+	Two models with the same interface buil_model (kind, num_classes) taking (B,1,64,64): a small CNN (3 conv-bn-relu-pool blocks 1 to 32 to 64 to 128, global average pool, dropout, linear) - build/test this first; and a compact CoAtNet (conv stem to 32, two MBConv blocks with a squeeze-excite to 64 to 128 giving an 8x8 grid, a learned positional embedding, two transformer blocks, then pooled linear head). Assert the grid is 8x8 so a wrong input size fails loudly. 
+
+File Four: train.py
+	Trains the model. Paper hyperparameterizes as defaults: Adam max LR 5e-4 (not 1e-3, the paper's model "collapsed" to random at 1e-3 after ~1100 epochs; 5e-4 fixes it), linear LR anneal, 1100 epochs, batch 16, cross entropy. Use a per-class stratisfied split (a plain random split on a 37x25 can zero out classes). On the fly augment each epoch (zero-padded spectrogram time-shift + SpecAugment). Add gradient clipping (norm 1.0) as collapse insurance. Save best checkpoint with: model_kind, state_dict, labels, val_index AND a content hash of the dataset (shal of X and Y) plus n_samples. Growing datapool across sessions: goal is to keep accumulating more keystroke recordings over time and have every retrain use the whole accumulated pile (old plus new together is "the pool"), NOT just the newest clips. Training on the pool sharpens the key signature; training on new clips alone causes catastrophic forgetting. 
+
+File Five: evaluate.py (numpy metrics, no sklearn)
+	Loads the checkpoint, evaluates on the same held out split it stored, prints accuracy macro F1 (over present classes only), per-key precision/recall/F1, saves a confusion matrix PNG and does an adjacent key clustering check. (do errors land on physically nearby key; the paper found that they do). CRITICAL guard: before reusing the stored val_index, verify the dataset's content hash matches the checkpoint's; if not, refuse with an error. (a rebuilt dataset silently mis indexes val_index and reports fake accuracy.
+
+Bugs to Avoid: (found the hard way, so bake them in from the start)
+	1) librosa vs numpy mel must match - slaney norm + center padding, verify numerically that the two paths give ~0 difference;
+	2) the energy detection peak floor must reference a high percentile, not the max, or one bad noise (couch/bump) suppresses all detections;
+	3) the dataset hash guard in evaluate.py
+	4) single sample rate assert when building the dataset (mixing 44.1k/48k poisons the mel frequency axis)
+	5) skip empty label folders
+	6) time shift augmentation must be zero-filled, not a circular roll that wraps the transient. 

@@ -1,0 +1,48 @@
+# --------------------------------------------------------------------------
+# Derived data -- excluded because it is regenerable and large.
+#
+# The rule: commit what cannot be recreated (the raw recordings), plus the
+# extracted pool and the results. Everything reconstructible from those by
+# running a command stays out, because binary audio does not delta-compress,
+# so every committed byte stays in history forever.
+# --------------------------------------------------------------------------
+
+# 165 MB/session of 48 kHz WAV, rebuilt in seconds from unconverted_raw/:
+#     ./convert_recordings.ps1 -Session day_N
+converted_wavs/
+
+# ~11 MB, rebuilt from training_clips/ in about a minute:
+#     python features.py --out day_N/dataset.npz
+# build_dataset is deterministic (sorted globs, deterministic mel), so a rebuild
+# is byte-identical and evaluate.py's dataset-hash guard still matches the
+# committed checkpoints.
+# By NAME, not *.npz -- dataset_pilot.npz is kept: its source clips no longer
+# exist, so it cannot be regenerated.
+dataset.npz
+
+# Scratch / smoke-test checkpoints at the repo ROOT only. The leading slash
+# matters: per-session checkpoints in day_N/ ARE committed -- they are results.
+/ckpt_*.pt
+/checkpoint.pt
+/checkpoint_coatnet.pt
+
+# Unlabelled confusion PNGs written by evaluate.py at the repo root; the
+# labelled, committed versions live in day_N/.
+/confusion.png
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Per-machine Claude Code permissions (hardcodes this box's Python path).
+# .claude/settings.json, if one is ever added, IS shared and stays tracked.
+.claude/settings.local.json
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
