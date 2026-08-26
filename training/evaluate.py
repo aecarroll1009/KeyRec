@@ -23,8 +23,8 @@ CRITICAL guard (the whole reason train.py stores a hash):
     hash the checkpoint was trained against.
 
 Usage:
-    python evaluate.py --data dataset.npz --ckpt checkpoint.pt
-    python evaluate.py --data dataset.npz --ckpt checkpoint.pt --cm confusion.png
+    python training/evaluate.py --data day_N/dataset.npz --ckpt day_N/checkpoint.pt
+    python training/evaluate.py --data day_N/dataset.npz --ckpt day_N/checkpoint.pt --cm confusion.png
 """
 
 import argparse

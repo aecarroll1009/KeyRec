@@ -10,9 +10,9 @@ than a level the model reached and held. The gap between each peak marker and
 its own rolling mean is the selection optimism in that number.
 
 Usage:
-    python plot_training.py --ckpt checkpoint.pt:SmallCNN \
-                            --ckpt checkpoint_coatnet.pt:CoAtNet \
-                            --out day_1/training_curves.png
+    python tools/plot_training.py --ckpt day_N/checkpoint.pt:SmallCNN \
+                            --ckpt day_N/checkpoint_coatnet.pt:CoAtNet \
+                            --out day_N/training_curves.png
 """
 
 import argparse

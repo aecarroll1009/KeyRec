@@ -21,6 +21,18 @@ import wave
 
 import numpy as np
 
+# --- repo layout bootstrap --------------------------------------------------
+# Pipeline modules live in training/ and the tools in tools/, so a module in one
+# cannot import one from the other by name alone. Put both directories on
+# sys.path so every script keeps working when run directly from any cwd.
+import os as _os
+import sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+for _d in (_os.path.join(_ROOT, "training"), _os.path.join(_ROOT, "tools")):
+    if _d not in _sys.path:
+        _sys.path.insert(0, _d)
+# ----------------------------------------------------------------------------
+
 import features as ft
 import isolate_keystrokes as ik
 

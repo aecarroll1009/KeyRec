@@ -9,8 +9,8 @@ This is the presentation version: same matrix, with key labels on both axes,
 counts in the cells, and the off-diagonal errors called out.
 
 Usage:
-    python plot_confusion.py --data dataset.npz --ckpt checkpoint.pt \
-                             --title SmallCNN --out day_1/confusion_cnn.png
+    python tools/plot_confusion.py --data day_N/dataset.npz --ckpt day_N/checkpoint.pt \
+                             --title SmallCNN --out day_N/confusion_cnn.png
 """
 
 import argparse
@@ -18,6 +18,19 @@ import os
 import sys
 
 import numpy as np
+
+# --- repo layout bootstrap --------------------------------------------------
+# Pipeline modules live in training/ and the tools in tools/, so a module in one
+# cannot import one from the other by name alone. Put both directories on
+# sys.path so every script keeps working when run directly from any cwd.
+import os as _os
+import sys as _sys
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+for _d in (_os.path.join(_ROOT, "training"), _os.path.join(_ROOT, "tools")):
+    if _d not in _sys.path:
+        _sys.path.insert(0, _d)
+# ----------------------------------------------------------------------------
+
 
 SURFACE = "#fcfcfb"
 TEXT_PRIMARY = "#0b0b0b"

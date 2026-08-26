@@ -20,14 +20,17 @@ converted_wavs/
 # exist, so it cannot be regenerated.
 dataset.npz
 
-# Scratch / smoke-test checkpoints at the repo ROOT only. The leading slash
-# matters: per-session checkpoints in day_N/ ARE committed -- they are results.
+# build/ is the scratch area: smoke checkpoints, throwaway datasets, plots made
+# while iterating. Everything in it is ignored, but the directory itself is kept
+# so it survives a clone and tools can write there without mkdir.
+build/*
+!build/.gitkeep
+
+# Stray scratch outputs at the repo ROOT. The leading slash matters:
+# per-session checkpoints in day_N/ ARE committed -- they are results.
 /ckpt_*.pt
 /checkpoint.pt
 /checkpoint_coatnet.pt
-
-# Unlabelled confusion PNGs written by evaluate.py at the repo root; the
-# labelled, committed versions live in day_N/.
 /confusion.png
 
 __pycache__/

@@ -15,11 +15,11 @@ anything; the failure modes below were all hit for real.
 
   1. Record one .m4a per key, ~25 presses, ~1 s apart, into unconverted_raw/day_N/.
      Crop the record/stop finger-taps off each file yourself first.
-  2. ./convert_recordings.ps1 -Session day_N   -> converted_wavs/day_N/<label>.wav
+  2. ./tools/convert_recordings.ps1 -Session day_N   -> converted_wavs/day_N/<label>.wav
      @ 48 kHz. One sample rate for the whole pool; features.py asserts it.
   3. ALWAYS dry-run before writing:
 
-       python isolate_keystrokes.py --auto --dry-run \
+       python tools/isolate_keystrokes.py --auto --dry-run \
               --raw-dir converted_wavs/day_N --expected 25
 
   4. Read the report, then drop --dry-run and add --session day_N to write.

@@ -12,8 +12,8 @@ session structure is MIRRORED from unconverted_raw into converted_wavs:
     unconverted_raw\day_1\a.m4a   ->   converted_wavs\day_1\a.wav
 
 Usage (from the project root):
-    ./convert_recordings.ps1 -Session day_2        # unconverted_raw\day_2 -> converted_wavs\day_2
-    ./convert_recordings.ps1                       # every session subfolder found
+    ./tools/convert_recordings.ps1 -Session day_2  # unconverted_raw\day_2 -> converted_wavs\day_2
+    ./tools/convert_recordings.ps1                 # every session subfolder found
     ./convert_recordings.ps1 -InDir "some\folder"  # a flat folder, no session subdivision
 
 Output name = input basename + .wav  (so a.m4a -> a.wav, space.m4a -> space.wav).
@@ -26,6 +26,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# This script lives in tools/, but the data directories are at the repo root.
+# Resolve the defaults against the repo root rather than the caller's current
+# directory, so it behaves the same whether invoked from the root or from
+# inside tools/. An explicitly-passed path is left exactly as given.
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+if (-not [System.IO.Path]::IsPathRooted($InDir))  { $InDir  = Join-Path $RepoRoot $InDir }
+if (-not [System.IO.Path]::IsPathRooted($OutDir)) { $OutDir = Join-Path $RepoRoot $OutDir }
 
 # --- locate ffmpeg (PATH first, then the winget install location) ---
 function Resolve-Tool([string]$name) {

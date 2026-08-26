@@ -1,4 +1,8 @@
-# Testing roadmap — real-data run, Test Day 1
+# Day 1 roadmap — first real-data run
+
+> Historical snapshot of the plan this session followed. Commands here predate the
+> `training/` + `tools/` reorganization and the `--review` mode that `--auto`
+> replaced; see `CLAUDE.md` for the current workflow.
 
 Full end-to-end test of the 5-file acoustic-keystroke pipeline on real recordings.
 

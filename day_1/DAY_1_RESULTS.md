@@ -59,22 +59,22 @@ that never touched training or model selection, scored once. Not yet wired into
 | `confusion_cnn.png` | labelled confusion matrix, SmallCNN |
 | `confusion_coatnet.png` | labelled confusion matrix, CoAtNet |
 | `confusion_*_raw.png` | the unlabelled PNGs `evaluate.py` writes itself (numpy+zlib, no matplotlib per spec) |
-| `test day 1.md` | the roadmap this session followed |
+| `DAY_1_ROADMAP.md` | the roadmap this session followed |
 
 `training_clips/` and `corpus/` deliberately stay in the project root — they are
 live and growing, not part of this snapshot.
 
 ## Reproducing this run
 
-The clips are in `training_clips/session01/`, with per-key detector settings in
+The clips are in `training_clips/day_1/`, with per-key detector settings in
 that folder's `isolation_params.json`. From the project root:
 
 ```powershell
 $py = "C:\Program Files\Python312\python.exe"
-& $py features.py --out day_1/dataset.npz
-& $py train.py --data day_1/dataset.npz --model cnn     --deterministic --out day_1/checkpoint.pt
-& $py train.py --data day_1/dataset.npz --model coatnet --deterministic --out day_1/checkpoint_coatnet.pt
-& $py plot_training.py --ckpt "day_1/checkpoint.pt:SmallCNN" --ckpt "day_1/checkpoint_coatnet.pt:CoAtNet" --out day_1/training_curves.png
+& $py training/features.py --out day_1/dataset.npz
+& $py training/train.py --data day_1/dataset.npz --model cnn     --deterministic --out day_1/checkpoint.pt
+& $py training/train.py --data day_1/dataset.npz --model coatnet --deterministic --out day_1/checkpoint_coatnet.pt
+& $py tools/plot_training.py --ckpt "day_1/checkpoint.pt:SmallCNN" --ckpt "day_1/checkpoint_coatnet.pt:CoAtNet" --out day_1/training_curves.png
 ```
 
 `--deterministic` makes CUDA runs bit-reproducible and costs nothing measurable
