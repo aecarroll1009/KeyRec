@@ -1,41 +1,49 @@
-# Project Scope (full copy of Claude's memory record)
+# Project Scope
 
-> This is a verbatim copy of the `project-acoustic-em-keystroke-classifier` memory file
-> maintained by Claude's auto-memory system. It's kept here so any agentic Claude session
-> working directly in this folder can see the full history/reasoning, not just the
-> `CLAUDE.md` summary next to this file. The memory-system copy is the source of truth —
-> if this drifts out of sync, treat that copy as authoritative and re-sync this one.
+Alex is building a keystroke-inference ML project in three phases.
 
----
+1. **Reproduce.** Recreate a 2023 academic paper on acoustic side-channel keyboard
+   attacks — mel-spectrogram features into a CNN/CoAtNet-style classifier, ~95% reported
+   accuracy from keystroke audio including audio captured over a call mic — as closely as
+   possible before diverging, so any later improvement is measurable against a known
+   baseline.
 
-Alex is building a keystroke-inference ML project in phases:
+2. **Generalize.** Extend from one typist/one keyboard to multiple typists on one
+   keyboard, then to different keyboard families (mechanical, ThinkPad-style chiclet, Mac
+   chiclet/scissor). Cross-keyboard/cross-typist generalization was the weak point of the
+   original paper.
 
-**Project home:** the entire ML project lives in `C:\Users\PC\Documents\ML Keystroke Recognizer\` (moved 2026-07-09 out of OneDrive, now a sibling of `C:\Users\PC\Documents\Arduino\` which houses the AJ's Sunrise Alarm project). The concrete Phase-1 five-file build spec is captured in the companion `project-keystroke-phase1-implementation` memory.
+3. **EM+acoustic sensor fusion**, Alex's own extension, not in the paper. Add a second,
+   independent side channel — EM/Van Eck emissions from the keyboard controller, captured
+   via SDR — as its own classifier, then a fusion/arbitration layer that reconciles the
+   acoustic model's and EM model's per-keystroke predictions. Disagreement between the
+   two channels is informative rather than noise, since they have different, largely
+   uncorrelated failure modes: acoustic degrades with ambient noise, distance, and
+   chiclet-style keys; EM degrades with shielding, distance, and controller design. This
+   is multimodal late fusion, the same family as camera+LIDAR fusion in robotics, and
+   EM+acoustic fusion specifically for keystroke inference does not appear to be a heavily
+   published combination.
 
-1. **Reproduce first.** Recreate a 2023 academic paper on acoustic side-channel keyboard attacks (mel-spectrogram features into a CNN/CoAtNet-style classifier, ~95% reported accuracy from keystroke audio, including audio captured over a call mic) as closely as possible before diverging, so any later improvement is measurable against a known baseline. He has already built this initial acoustic model at his GD internship workstation — that code is air-gapped there, so in future sessions he'll paste a written spec of the implementation rather than the code itself.
+**Load-bearing framing.** A DDC+FFT front-end alone only supports the claim that Alex can
+tape out real DSP silicon — the attack classifies identically whether that DSP runs
+on-chip or in numpy. To make the silicon necessary, the narrative anchors to a
+self-contained, real-time, untethered side-channel appliance that captures EM+acoustic
+and featurizes on-chip, so classification happens live at the edge with no PC in the
+loop.
 
-2. **Generalize.** Extend from one typist/one keyboard to multiple typists on one keyboard, then to different keyboard families (mechanical, ThinkPad-style chiclet, Mac chiclet/scissor, etc.) — cross-keyboard/cross-typist generalization was the weak point of the original paper.
+**CORDIC facts:** rotation mode does NCO/mixer/down-conversion; vectoring mode does
+rect-to-polar (magnitude/phase), and the EM feature path may want both. Gain factor
+K≈1.647 needs correction. Verification approach: use an SDR's own internal DDC output as
+a reference to check the custom CORDIC DDC to within quantization tolerance.
 
-3. **Novel extension (his own idea, not in the paper): EM+acoustic sensor fusion.** Add a second, independent side channel — EM/Van Eck emissions from the keyboard controller, captured via SDR (a HamGeek XC7Z010 board, firmware-hacked AD9363→AD9361 behavior, ~$65, was picked for this and related RF work — see the CORDIC/silicon section below for how the capture chain now folds into this project's own front-end tapeout) — as its own classifier, then a fusion/arbitration layer that reconciles the acoustic model's and EM model's per-keystroke predictions. Disagreement between the two channels is treated as informative rather than noise, since the two channels have different, largely uncorrelated failure modes (acoustic degrades with ambient noise/distance/chiclet-style keys; EM degrades with shielding/distance/controller design). This is a multimodal late-fusion architecture (same family as camera+LIDAR fusion in robotics); EM+acoustic fusion specifically for keystroke inference doesn't appear to be a heavily published combination, making it a potential genuine differentiator — possibly workshop-paper-worthy if done with a rigorous generalization study.
+**Front-end build order**, from `cordic_ddc_nco_mixer_datapath.png` in this folder: floor
+(build now) is NCO (phase accumulator → CORDIC in rotation mode, sin/cos) → mixer
+(complex multiply against EM input) → decimating FIR/CIC, where the K≈1.647 gain
+correction is folded in. Stretch (in development) is input mux (EM-path output vs.
+baseband acoustic input) → FFT (folded, single reused butterfly) → magnitude
+(vectoring-mode CORDIC) → mel filterbank → log (hyperbolic-mode CORDIC) → log-mel frames
+out to the ML recognizer.
 
-**Priority (established 2026-07-04):** this is Alex's primary, most-invested project among his current RF/security hobby work — he explicitly ranks it above his TEMPEST-video (HDMI/laptop-screen Van Eck) and RollJam projects, which he considers "cool but secondary/fun side things" by comparison. He wants to show this one to a professor and considers it his strongest portfolio piece. It's also a deliberate career-strategy bridge: it pairs DSP/signal-processing/silicon-design skill (now built directly into this project via the CORDIC+FFT front-end tapeout, see below) with hardware side-channel security, which he sees as directly relevant to his goal of an Apple Hardware role (their Secure Enclave/anti-tamper silicon teams study exactly this class of leakage).
-
-**Practical implementation notes discussed:** needs a synchronized capture pipeline (audio interface + SDR EM capture, with a calibrated fixed-delay offset since EM propagates ~instantly vs. sound at ~343 m/s) and ground-truth keylogging on the test machine to label both streams per keystroke.
-
-**Publication goal (set 2026-07-04):** Alex intends to pursue this as genuine independent/student research, not just a portfolio repo. Plan: (1) post an **arXiv preprint** once the reproduction + fusion work is solid enough to write up, for a citable public timestamp regardless of any venue outcome; (2) target **USENIX WOOT** (Workshop on Offensive Technologies) as the realistic first peer-reviewed venue for a demo/paper, since it's built for exactly this kind of practical-attack work — IEEE HOST and EuroS&PW (the original acoustic paper's own venue) are backup/alternative workshop targets. He also wants to explore a UW affiliation via the Allen School's Security and Privacy Research Lab (seclab.cs.washington.edu — Roesner/Kohno/Tyagi as of 2026) for a faculty advisor, independent-study credit, and — critically — **IRB approval**, which he'll need before collecting audio/EM data from any typist other than himself for the generalization phase.
-
-**HARDWARE PIVOT (2026-07-17): this is now Alex's SOLE flagship — the standalone modem/CORDIC tapeout project is DROPPED** (that memory file deleted; he didn't feel invested in it vs. this). Instead the hardware is being folded *into* this project so it becomes one massive project spanning acquisition → DSP → ML → custom silicon → published research. The CORDIC work survives here as the EM front-end. Reasoning for consolidation: the modem project's only real purpose was proving RTL-design+verification+tapeout skill; getting that same credential *inside* the flagship loses nothing and reads as depth. The load-bearing test agreed with Alex: the silicon must sit on the critical path, not be bolted on.
-
-**Silicon scope (2026-07-17, DECIDED): ONE tapeout — the front-end chip. The CNN inference accelerator is BENCHED** (parked, not being pursued now — see below). So the single silicon deliverable for this project is:
-
-**Front-end chip — "streaming log-mel spectral front-end."** ONE die combining the **CORDIC DDC** (rotation-mode NCO+mixer → decimating FIR, down-converts captured EM/Van Eck emissions to baseband IQ) **+ a folded FFT → mel-filterbank → log** feature engine. Natural single-chip partition (standard SDR receiver front-end; one streaming datapath: raw EM samples in → log-mel spectrogram frames out). The **log** in log-mel can reuse a CORDIC in hyperbolic mode. Acoustic audio is already baseband so it **bypasses the DDC via a mux and enters at the FFT stage** — makes the "shared back half" real in hardware. Keep the FFT small/folded (modest point size, single reused butterfly, memory-scheduled) so it fits a full MPW shuttle — it is **too big for Tiny Tapeout**; the iterative CORDIC alone would fit Tiny Tapeout but the combined front-end needs a real shuttle. **VERIFY which free student MPW shuttle is actually open before planning** (that landscape shifted a lot in 2025 — don't assume from stale knowledge). This chip is ready to design NOW — the CORDIC work already exists.
-
-**CNN inference accelerator — BENCHED (2026-07-17).** Considered as a possible second chip (small MAC/systolic array streaming the SmallCNN) but Alex parked it to keep scope focused on the CORDIC+FFT front-end as the main tapeout. It stays a clean *future* phase-2 if he ever revives it (its input is exactly the front-end's spectrogram-frame output), but do NOT treat it as active work. If revived, the prior reasoning holds: separate die from the front-end (risk/schedule isolation), designed in one integrated RTL/FPGA system but fabricated as two, joined by a valid/ready AXI-Stream-like frame interface.
-
-**Load-bearing framing (important):** a DDC+FFT front-end is only load-bearing for the "I can tape out real DSP silicon" claim — the attack classifies identically whether that DSP runs on-chip or in numpy, and a sharp reviewer will note that. To make the silicon *necessary*, anchor the narrative to a **self-contained, real-time, untethered side-channel appliance** that captures EM+acoustic and featurizes on-chip so classification happens live at the edge (no PC in the loop). Then the front-end chip has to exist to do the DSP in the untethered device.
-
-**CORDIC technical facts worth keeping (migrated from the deleted modem memory):** rotation mode = NCO/mixer/down-conversion; vectoring mode = rect-to-polar (magnitude/phase) — the EM feature path may want both. Gain-factor **K≈1.647** correction needed. Design-depth talking points: iterative-vs-pipelined area/throughput tradeoff, bit-width/precision management, angle range reduction. Verification idea if real RF hardware is added: use an SDR's own internal DDC output as a reference to check the custom CORDIC DDC to within quantization tolerance.
-
-**Front-end block diagram + build-now vs. stretch split (2026-08-16):** `cordic_ddc_nco_mixer_datapath.png` in this folder lays out the full front-end datapath and marks build sequencing. **Floor (build now):** NCO (phase accumulator → CORDIC in rotation mode, sin/cos) → Mixer (complex multiply against EM input) → Decimating FIR/CIC — **this is where the K≈1.647 gain correction is actually folded in**, per the diagram, not a separate stage. **Stretch (in development):** Input mux (EM-path output vs. baseband acoustic input) → FFT (folded, single reused butterfly) → Magnitude (vectoring-mode CORDIC) → Mel filterbank (triangular weights) → Log (hyperbolic-mode CORDIC) → log-mel frames out to the ML recognizer. Confirms the acoustic-bypass-at-the-mux design matches what was discussed. Nothing in the diagram contradicts prior planning; this just adds the concrete build order — DDC half first, feature half second — and pins the gain-correction location.
-
-**Phase-1 ML progress has diverged materially from this file — `CLAUDE.md` in this folder is now the current source of truth for that, not this file (as of 2026-08-16).** Since this file was last synced, Alex has: completed the GPU migration (torch 2.12.1+cu130 on the RTX 3070 Ti Laptop, sm_86), with a second Opus critic audit that day fixing 7 real CUDA defects; run a full real-data session (`day_1`, 27 classes incl. space, 25 presses each, 675 clips) getting SmallCNN to 92.6% / CoAtNet to 98.5% best-val accuracy with the paper's signature adjacent-key-error pattern reproduced by both — though `CLAUDE.md` itself flags these as optimistic checkpoint-selection numbers, with realistic held-out estimates closer to ~89–90% (CNN) / ~95–96% (CoAtNet); and established a session-based clip-extraction workflow (`unconverted_raw/<session> → converted_wavs/<session> → training_clips/<session>`, plus a `corpus/` held-out set never trained on) with hard-won gotchas documented in `isolate_keystrokes.py`'s docstring (per-file threshold tuning varies 4.5–26, judge by coverage not just count, never skip `--session` when growing the pool). **Don't reconstruct ML-progress detail from this file going forward — read `CLAUDE.md` fresh each session, it's kept current in a way this file is not.**
+Current ML progress and the full silicon build-order/verification detail live in
+`CLAUDE.md` and `hardware/DDC_FRONTEND_SCOPE.md`, which are kept current; this file is
+the stable project overview.
