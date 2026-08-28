@@ -1,21 +1,7 @@
-"""model.py  --  File 3 of the acoustic-keystroke reproduction pipeline.
+"""File 3 of the acoustic-keystroke reproduction pipeline.
 
-Two classifiers over a single-channel 64x64 log-mel image, exposed through one
-interface:
-
-    build_model(kind, num_classes) -> nn.Module        # input (B, 1, 64, 64)
-
-    kind="cnn"      small 3-block conv net (build/test this FIRST)
-    kind="coatnet"  compact CoAtNet: conv stem + MBConv(+SE) + transformer
-
-Design constraints (from the project spec):
-  * torch is imported LAZILY -- `import model` is cheap and works even with no
-    torch installed; the import only happens the first time you build a model.
-    The nn.Module subclasses are therefore defined inside a cached factory
-    (you cannot subclass nn.Module before torch exists).
-  * The CoAtNet convolutional trunk must reduce a 64x64 input to an 8x8 grid.
-    That is asserted in forward() so a wrong input size fails LOUDLY rather
-    than silently reshaping garbage into the transformer.
+Defines two classifiers over a single-channel 64x64 log-mel image.
+build_model(kind, num_classes) returns an nn.Module taking input (B, 1, 64, 64).
 """
 
 GRID = 8            # CoAtNet conv trunk must produce an 8x8 token grid (64 -> 8)
@@ -33,28 +19,33 @@ _CLASSES = None
 
 
 def _require_torch():
-    """Import torch on demand. Kept out of module top-level so that merely
-    importing this file (e.g. for its constants) never forces a torch install."""
+    """Import torch on demand.
+
+    Merely importing this module does not require torch.
+
+    Returns:
+        A (torch, nn) tuple.
+    """
     import torch
     from torch import nn
     return torch, nn
 
 
-def _get_classes():
-    """Define and cache the nn.Module subclasses on first use."""
-    global _CLASSES
-    if _CLASSES is not None:
-        return _CLASSES
+def _make_small_cnn(nn):
+    """Build the SmallCNN class.
 
-    torch, nn = _require_torch()
+    Args:
+        nn: The torch.nn module.
 
-    # ---- small CNN ------------------------------------------------------
+    Returns:
+        The SmallCNN nn.Module subclass.
+    """
+
     class SmallCNN(nn.Module):
         """3 x (conv-bn-relu-pool), 1->32->64->128, global avg pool, dropout, linear.
 
-        Each block halves the spatial size: 64 -> 32 -> 16 -> 8. The final
-        global average pool makes the head independent of the exact grid, so
-        this model is the robust baseline to bring up first.
+        Each block halves the spatial size: 64 -> 32 -> 16 -> 8. Global
+        average pooling makes the head independent of the exact grid.
         """
 
         def __init__(self, num_classes):
@@ -83,7 +74,20 @@ def _get_classes():
             x = self.drop(x)
             return self.head(x)
 
-    # ---- CoAtNet building blocks ---------------------------------------
+    return SmallCNN
+
+
+def _make_squeeze_excite(nn, torch):
+    """Build the SqueezeExcite class.
+
+    Args:
+        nn: The torch.nn module.
+        torch: The torch package.
+
+    Returns:
+        The SqueezeExcite nn.Module subclass.
+    """
+
     class SqueezeExcite(nn.Module):
         """Channel attention: squeeze to a per-channel scalar, gate with sigmoid."""
 
@@ -99,11 +103,26 @@ def _get_classes():
             s = torch.sigmoid(self.fc2(s))
             return x * s
 
+    return SqueezeExcite
+
+
+def _make_mbconv(nn, squeeze_excite):
+    """Build the MBConv class.
+
+    Args:
+        nn: The torch.nn module.
+        squeeze_excite: The SqueezeExcite class, as returned by
+            _make_squeeze_excite().
+
+    Returns:
+        The MBConv nn.Module subclass.
+    """
+
     class MBConv(nn.Module):
         """Inverted-residual block: 1x1 expand -> depthwise 3x3 -> SE -> 1x1 project.
 
-        A residual connection is used only when it is valid (stride 1 and equal
-        in/out channels); the two blocks here both downsample, so they do not.
+        A residual connection is used only when stride is 1 and the in/out
+        channels match. Both CoAtNet blocks downsample, so neither uses one.
         """
 
         def __init__(self, cin, cout, stride, expand=MBCONV_EXPAND):
@@ -121,7 +140,7 @@ def _get_classes():
                 nn.BatchNorm2d(mid),
                 nn.GELU(),
             )
-            self.se = SqueezeExcite(mid)
+            self.se = squeeze_excite(mid)
             self.project = nn.Sequential(
                 nn.Conv2d(mid, cout, 1, bias=False),
                 nn.BatchNorm2d(cout),
@@ -135,6 +154,19 @@ def _get_classes():
             if self.use_res:
                 out = out + x
             return out
+
+    return MBConv
+
+
+def _make_transformer_block(nn):
+    """Build the TransformerBlock class.
+
+    Args:
+        nn: The torch.nn module.
+
+    Returns:
+        The TransformerBlock nn.Module subclass.
+    """
 
     class TransformerBlock(nn.Module):
         """Pre-norm self-attention + MLP, standard residual transformer block."""
@@ -157,6 +189,23 @@ def _get_classes():
             x = x + self.mlp(self.norm2(x))
             return x
 
+    return TransformerBlock
+
+
+def _make_coatnet(nn, torch, mbconv, transformer_block):
+    """Build the CoAtNet class.
+
+    Args:
+        nn: The torch.nn module.
+        torch: The torch package.
+        mbconv: The MBConv class, as returned by _make_mbconv().
+        transformer_block: The TransformerBlock class, as returned by
+            _make_transformer_block().
+
+    Returns:
+        The CoAtNet nn.Module subclass.
+    """
+
     class CoAtNet(nn.Module):
         """Conv stem -> 32, two MBConv(+SE) blocks 64->128, then transformer.
 
@@ -164,9 +213,9 @@ def _get_classes():
             stem  (stride 2): 64 -> 32,  channels 1  -> 32
             MBConv(stride 2): 32 -> 16,  channels 32 -> 64
             MBConv(stride 2): 16 -> 8,   channels 64 -> 128   (8x8 token grid)
-        The 8x8 grid is flattened to 64 tokens of width 128, given a learned
-        positional embedding, processed by two transformer blocks, mean-pooled,
-        and sent through a linear head.
+        The 8x8 grid becomes 64 tokens of width 128, plus a learned
+        positional embedding. Two transformer blocks process them, then
+        mean-pooling and a linear head classify.
         """
 
         def __init__(self, num_classes):
@@ -176,14 +225,14 @@ def _get_classes():
                 nn.BatchNorm2d(32),
                 nn.GELU(),
             )
-            self.mbconv1 = MBConv(32, 64, stride=2)
-            self.mbconv2 = MBConv(64, 128, stride=2)
+            self.mbconv1 = mbconv(32, 64, stride=2)
+            self.mbconv2 = mbconv(64, 128, stride=2)
 
             self.pos_embed = nn.Parameter(torch.zeros(1, GRID * GRID, EMBED_DIM))
             nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
             self.blocks = nn.ModuleList(
-                [TransformerBlock(EMBED_DIM, N_HEADS) for _ in range(N_TRANSFORMER)]
+                [transformer_block(EMBED_DIM, N_HEADS) for _ in range(N_TRANSFORMER)]
             )
             self.norm = nn.LayerNorm(EMBED_DIM)
             self.head = nn.Linear(EMBED_DIM, num_classes)
@@ -194,9 +243,8 @@ def _get_classes():
             x = self.mbconv2(x)
 
             b, c, h, w = x.shape
-            # Fail loudly if the conv trunk did not land on the expected grid --
-            # a wrong input size would otherwise be silently reshaped into the
-            # transformer and mis-add the positional embedding.
+            # A wrong input size would otherwise be silently reshaped into
+            # the transformer and misapply the positional embedding.
             assert h == GRID and w == GRID, (
                 f"CoAtNet expects a {GRID}x{GRID} grid before the transformer "
                 f"(got {h}x{w}); input must be (B, 1, 64, 64)"
@@ -211,7 +259,28 @@ def _get_classes():
             pooled = tokens.mean(dim=1)               # (B, 128)
             return self.head(pooled)
 
-    _CLASSES = {"cnn": SmallCNN, "coatnet": CoAtNet}
+    return CoAtNet
+
+
+def _get_classes():
+    """Build and cache the model classes on first use.
+
+    Returns:
+        Dict mapping model kind ("cnn", "coatnet") to its nn.Module subclass.
+    """
+    global _CLASSES
+    if _CLASSES is not None:
+        return _CLASSES
+
+    torch, nn = _require_torch()
+
+    small_cnn = _make_small_cnn(nn)
+    squeeze_excite = _make_squeeze_excite(nn, torch)
+    mbconv = _make_mbconv(nn, squeeze_excite)
+    transformer_block = _make_transformer_block(nn)
+    coatnet = _make_coatnet(nn, torch, mbconv, transformer_block)
+
+    _CLASSES = {"cnn": small_cnn, "coatnet": coatnet}
     return _CLASSES
 
 
@@ -219,7 +288,15 @@ def _get_classes():
 # Public interface
 # ----------------------------------------------------------------------------
 def build_model(kind, num_classes):
-    """Construct a classifier. kind in {"cnn", "coatnet"}; input is (B,1,64,64)."""
+    """Construct a classifier.
+
+    Args:
+        kind: Model kind, "cnn" or "coatnet".
+        num_classes: Number of output classes.
+
+    Returns:
+        An nn.Module accepting input of shape (B, 1, 64, 64).
+    """
     classes = _get_classes()
     key = kind.lower()
     if key not in classes:
@@ -228,7 +305,14 @@ def build_model(kind, num_classes):
 
 
 def count_parameters(model):
-    """Number of trainable parameters -- handy for a quick sanity print."""
+    """Count trainable parameters.
+
+    Args:
+        model: An nn.Module.
+
+    Returns:
+        The number of parameters with requires_grad set.
+    """
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 

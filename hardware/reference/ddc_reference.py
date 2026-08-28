@@ -1,150 +1,12 @@
-"""
-Numpy reference model of the EM channel's DDC front-end (the "floor" blocks).
+"""Numpy reference model of the EM channel's DDC front-end.
 
     EM samples --> [ Mixer ] --> [ Decimating FIR ] --> baseband IQ
                        ^
                    [  NCO  ]  phase accumulator -> rotation-mode CORDIC
 
-This is the reference the SystemVerilog in `hardware/` is checked against.
-Per `hardware/DDC_FRONTEND_SCOPE.md`: the reference model comes first because it
-catches sign-convention and K-scaling bugs in minutes, where finding the same
-bug in RTL simulation costs a day.
-
-
-WHY THERE ARE TWO MODELS IN HERE
---------------------------------
-`ddc_ideal()`  -- float64, exact. Says what the answer SHOULD be.
-`DDC.run()`    -- bit-exact fixed point. Says what the RTL MUST produce.
-
-They serve different jobs and you need both:
-
-  * RTL is checked against the FIXED-POINT model, bit for bit. Any mismatch is
-    an RTL bug, full stop. There is no "close enough" tolerance to hide behind.
-  * The fixed-point model is checked against the IDEAL model in SNR/SFDR. That
-    tells you whether the chosen widths are good enough, which is an
-    architecture question, not a correctness question.
-
-A float-only reference model would let a truncation-vs-rounding disagreement, a
-saturation that never fires in the model but does in RTL, or a coefficient
-scaled by K instead of 1/K all pass silently. Those are exactly the bugs this
-file exists to catch.
-
-
-THE TWO SIGN CONVENTIONS THAT WILL BITE
----------------------------------------
-1. Down-conversion multiplies by exp(-j*theta), i.e. by the CONJUGATE of the
-   NCO output. There are two ways to get this wrong and they fail very
-   differently:
-
-     * multiplying by the NCO rather than its conjugate UP-converts: the tone
-       moves to 2*f_lo + delta and the decimating lowpass deletes it. Loud,
-       obvious, caught on the first plot.
-
-     * negating Q -- one flipped subtraction in the Q equation -- yields
-       conj(x * exp(-j*theta)), which MIRRORS the spectrum about DC. Same
-       amplitude, same bandwidth, plausible magnitude spectrogram, and every
-       feature on the wrong side of the carrier. This is the one that ships,
-       and it stays invisible right up until you care which sideband something
-       came from.
-
-   `test_ddc_reference.py::test_sign_convention_is_not_mirrored` pins both down,
-   and `test_a_mirrored_mixer_would_be_caught` builds the quiet bug on purpose
-   to prove that test can actually see it.
-
-2. CORDIC rotation mode drives z to zero, so to rotate a vector BY -theta you
-   seed z0 = -theta, not +theta. In the fused mixer that is the difference
-   between down-converting and up-converting.
-
-
-K-SCALING: WHERE THE 1.6467 GOES, AND WHY IT DIFFERS PER ARCHITECTURE
----------------------------------------------------------------------
-The rotation-mode CORDIC has gain K = prod sqrt(1 + 2^-2i) ~= 1.6467. It has to
-be removed somewhere, and the two mixer architectures in the comparison study
-remove it in DIFFERENT places:
-
-  MIX_SEPARATE : the CORDIC only makes sin/cos. Seed it with x0 = 1/K and the
-                 output comes out unit-amplitude for free -- a constant folded
-                 into a ROM/immediate, costing nothing. The FIR coefficients are
-                 then plain.
-
-  MIX_FUSED    : the SIGNAL itself is the rotated vector, so it comes out scaled
-                 by K. There is no free seed to hide it in, so the FIR
-                 coefficients carry the 1/K instead (this is the "gain K~1.647
-                 folded" note in the datapath diagram).
-
-Both paths therefore land at the SAME output scale, which is the only reason
-their areas and SNRs are comparable at all. If you ever change one, change the
-other: a fused build with plain coefficients is 4.3 dB hot and will look like it
-has better SNR than it does. `DDC` sets this automatically from `mix_arch`;
-`fir_taps_quantized()` takes `fold_inv_k` explicitly so the choice stays visible.
-
-
-THE NCO'S TWO WIDTHS: M AND N
------------------------------
-M (`phase_bits`) is the accumulator width and sets FREQUENCY RESOLUTION:
-fs/2^M. At M=32 and 2.4 MS/s that is 0.56 mHz, so any LO you ask for is placed
-essentially exactly.
-
-N (`phase_trunc_bits`) is how many of those bits reach the angle path, and sets
-SPECTRAL PURITY. Truncating M down to N throws information away every sample,
-and the error is periodic, so it appears as discrete spurs rather than noise.
-The classic worst-case bound is ~6.02*N dBc -- 84 dB at N=14 -- and nothing
-downstream buys past it: not CORDIC iterations, not datapath width.
-
-These are independent knobs and it is worth keeping them that way. `ang_bits`
-is a third, separate number: the CORDIC's internal angle register, which is
-kept wider than N (the truncated phase is zero-padded into it) so the rotation
-converges on the truncated angle rather than quantizing it a second time. Using
-N as the z width too would cap useful iterations at 13 for N=14, because past
-that the atan table entries round to zero and the stages do nothing.
-
-MEASURING N HONESTLY -- THE BINARY-FRACTION TRAP
-------------------------------------------------
-Phase truncation only produces error when the FCW has nonzero bits below the
-truncation point. If the LO is a binary fraction of the sample rate, those bits
-are always zero and there is NO truncation error at all, at any N.
-
-The default config is exactly that case: 300 kHz at 2.4 MS/s gives PHASE_INC =
-0x20000000, whose low 18 bits are zero. Measured there, the NCO scores 93 dB
-SFDR and N=14 looks free. Measured 98 Hz away, it scores 82 dB -- right at the
-6.02*N bound. The second number is the real one.
-
-So `report()` measures both and labels which case the configured LO is, and
-`cfg.phase_trunc_residue` is the flag: zero means the measurement is flattering
-and must not be quoted as the NCO's spectral purity.
-
-
-CONVERGENCE / RANGE REDUCTION
------------------------------
-A rotation-mode CORDIC only converges for |z| <= sum(atan(2^-i)) ~= 1.7433 rad,
-which is just over pi/2 and well under pi. So the full circle is handled by
-splitting the phase word into a 2-bit quadrant and a residual in [0, pi/2), then
-fixing up the quadrant with negates and swaps -- muxes in RTL, no arithmetic.
-`quadrant_split()` / `apply_quadrant_sincos()` / `prerotate_conj()`.
-
-Note the residual can reach pi/2 = 1.5708, which is inside the 1.7433 bound but
-not by a lot. That margin is real and is what `test_cordic_converges_at_the_
-range_reduction_boundary` guards.
-
-
-USAGE
------
-    python hardware/reference/ddc_reference.py --report
-    python hardware/reference/ddc_reference.py --report --mix-arch fused
-    python hardware/reference/ddc_reference.py --compare-arch
-    python hardware/reference/ddc_reference.py --emit-vectors build/ddc_vectors
-
-`--emit-vectors` writes flat hex files plus a `ddc_params.svh`, so the testbench
-reads the same numbers this model produced rather than re-deriving them (a
-testbench that re-derives the reference is testing the testbench).
-
-Write them into `build/` -- they are regenerable from one command, and the
-repo's rule is to commit only what cannot be recreated. Regenerate them whenever
-the config changes; `manifest.json` records the config each set was made under,
-so a stale set is identifiable rather than merely wrong.
-
-Depends on numpy only -- deliberately. No scipy, so this can run wherever the
-simulator runs. The window-method FIR design is ten lines and is inlined below.
+`ddc_ideal()` computes the exact float64 answer. `DDC.run()` computes the
+bit-exact fixed-point answer the RTL must match. Run with --report,
+--compare-arch, or --emit-vectors.
 """
 
 from __future__ import annotations
@@ -186,9 +48,14 @@ def full_scale(bits: int) -> int:
 def sat(x, bits: int):
     """Saturate to a `bits`-wide two's-complement range.
 
-    Saturation, not wrapping. A DDC that wraps on overflow turns a loud burst
-    into full-scale noise across the whole band, which is far worse than
-    clipping it -- and keystroke EM capture is exactly the bursty case.
+    Clips rather than wraps, so an overflow does not corrupt the whole band.
+
+    Args:
+        x: Values to saturate.
+        bits: Target word width.
+
+    Returns:
+        `x` clipped to the representable range of a `bits`-wide signed word.
     """
     lo = -(1 << (bits - 1))
     hi = (1 << (bits - 1)) - 1
@@ -196,7 +63,7 @@ def sat(x, bits: int):
 
 
 def would_saturate(x, bits: int) -> int:
-    """How many elements sat() would clip. Reported, never silently ignored."""
+    """Count how many elements sat() would clip."""
     lo = -(1 << (bits - 1))
     hi = (1 << (bits - 1)) - 1
     a = np.asarray(x, dtype=np.int64)
@@ -214,15 +81,17 @@ def assert_fits(x, name: str, bits: int = 62) -> None:
 
 
 def shr(x, s: int, mode: str = TRUNC):
-    """Arithmetic right shift by `s`, matching what the RTL does.
+    """Right-shift `x` by `s`, matching the RTL's shift behavior.
 
-    TRUNC is Verilog's `>>>` on a signed value: floor, biased toward -inf.
-    ROUND is round-half-up, one adder more expensive.
+    TRUNC floors, like Verilog's `>>>`. ROUND is round-half-up.
 
-    Which one you pick matters. Truncation in the CORDIC iteration is a DC
-    offset that accumulates over iterations; most published CORDIC RTL truncates
-    and eats it. The model defaults to TRUNC so it matches the cheap RTL, and
-    `--shift-mode round` lets you measure what the adders would buy.
+    Args:
+        x: Values to shift.
+        s: Shift amount; values with s <= 0 are returned unchanged.
+        mode: TRUNC or ROUND.
+
+    Returns:
+        `x` shifted right by `s`.
     """
     a = np.asarray(x, dtype=np.int64)
     if s <= 0:
@@ -248,18 +117,22 @@ def cordic_gain(n_iter: int) -> float:
 
 
 def cordic_convergence_limit(n_iter: int) -> float:
-    """sum atan(2^-i) -- the largest |z0| the rotation mode can drive to zero."""
+    """The largest |z0| the rotation mode can drive to zero: sum atan(2^-i)."""
     return float(sum(math.atan(2.0 ** -i) for i in range(n_iter)))
 
 
 def atan_table(n_iter: int, ang_bits: int) -> np.ndarray:
-    """atan(2^-i) in angle LSBs, where a full circle is 2**ang_bits.
+    """Compute atan(2^-i) in angle LSBs for each CORDIC iteration.
 
-    This table is quantized, so the CORDIC cannot resolve angle better than one
-    LSB no matter how many iterations you run. Past roughly ang_bits iterations
-    the table entries collapse to 1 and then 0, and extra stages buy nothing --
-    `DDC.__post_init__` checks for that rather than letting you pay for dead
-    hardware.
+    Entries round to zero past about ang_bits iterations, so extra stages
+    beyond that add no accuracy.
+
+    Args:
+        n_iter: Number of CORDIC iterations to generate entries for.
+        ang_bits: Angle word width; a full circle is 2**ang_bits.
+
+    Returns:
+        One table entry per iteration, in angle LSBs.
     """
     scale = (1 << ang_bits) / (2.0 * math.pi)
     return np.array(
@@ -271,12 +144,18 @@ def atan_table(n_iter: int, ang_bits: int) -> np.ndarray:
 def cordic_rotate(x, y, z, table: np.ndarray, width: int, shift_mode: str = TRUNC):
     """Bit-exact rotation-mode CORDIC, vectorised over a whole sample array.
 
-    Rotates (x, y) by the angle z and scales it by K. Drives z toward zero, so
-    a POSITIVE z0 rotates counter-clockwise; to rotate by -theta pass z0=-theta.
+    Rotates (x, y) by angle z, scaling the result by K. Pass z0=-theta to
+    rotate by -theta.
 
-    The loop body is deliberately written as the RTL stage it maps to: a compare
-    for the direction, two shifts, two add/subs, one angle add/sub. Nothing here
-    should be tempting to "optimise" -- the point is that it mirrors hardware.
+    Args:
+        x, y: Initial vector components, at `width` bits.
+        z: Initial angle, in the same LSB units as `table`.
+        table: Per-iteration atan values from `atan_table()`.
+        width: Datapath width for x and y.
+        shift_mode: TRUNC or ROUND, for the per-iteration shifts.
+
+    Returns:
+        The rotated (x, y) and the residual angle z after all iterations.
     """
     n_iter = len(table)
     x = sat(x, width)
@@ -296,18 +175,31 @@ def cordic_rotate(x, y, z, table: np.ndarray, width: int, shift_mode: str = TRUN
 def quadrant_split(phase, ang_bits: int):
     """Split an unsigned phase word into (quadrant 0..3, residual in [0, pi/2)).
 
-    In RTL this is a bit slice, not arithmetic: the top two bits are the
-    quadrant and the rest is the residual, because a full circle is 2**ang_bits.
+    In RTL this is a bit slice, not arithmetic. The top two bits give the
+    quadrant, and the rest gives the residual.
+
+    Args:
+        phase: Angle-domain phase values, at ang_bits width.
+        ang_bits: Angle word width.
+
+    Returns:
+        A (quadrant, residual) tuple.
     """
     p = np.asarray(phase, dtype=np.int64) & ((1 << ang_bits) - 1)
     return p >> np.int64(ang_bits - 2), p & ((1 << (ang_bits - 2)) - 1)
 
 
 def apply_quadrant_sincos(q, c, s):
-    """Lift (cos, sin) of the residual up to the full circle.
+    """Lift the residual's (cos, sin) pair to the full circle.
 
-    cos(q*pi/2 + r) and sin(q*pi/2 + r) are just the residual's pair with signs
-    swapped around -- muxes and negates, no multiplier.
+    Uses sign swaps only, no multiplier.
+
+    Args:
+        q: Quadrant, 0..3.
+        c, s: (cos, sin) of the residual angle.
+
+    Returns:
+        A (cos, sin) tuple lifted to the full circle.
     """
     q = np.asarray(q, dtype=np.int64)
     conds = [q == 0, q == 1, q == 2, q == 3]
@@ -319,10 +211,15 @@ def apply_quadrant_sincos(q, c, s):
 def prerotate_conj(q, xi, xq):
     """Multiply (xi + j*xq) by exp(-j*q*pi/2).
 
-    The fused mixer's range reduction. The CORDIC can only take the residual
-    angle, so the quadrant part of the rotation is applied to the input vector
-    first -- and because it is a multiple of 90 degrees it is again only swaps
-    and negates.
+    Applies the quadrant part of the rotation before the CORDIC handles the
+    residual. Being a multiple of 90 degrees, this needs only sign swaps.
+
+    Args:
+        q: Quadrant, 0..3.
+        xi, xq: Input I/Q samples.
+
+    Returns:
+        The (i, q) input rotated by -q*pi/2.
     """
     q = np.asarray(q, dtype=np.int64)
     conds = [q == 0, q == 1, q == 2, q == 3]
@@ -337,12 +234,18 @@ def prerotate_conj(q, xi, xq):
 
 
 def firwin_lowpass(n_taps: int, cutoff_norm: float) -> np.ndarray:
-    """Window-method lowpass, unit DC gain. cutoff_norm is fc/(fs/2).
+    """Design a window-method lowpass FIR with unit DC gain.
 
-    Blackman window: ~-74 dB sidelobes, which is the right neighbourhood for a
-    16-bit datapath (a -74 dB alias sits near the quantization floor, so neither
-    dominates). Inlined instead of calling scipy.signal.firwin so this model has
-    no dependency beyond numpy.
+    Uses a Blackman window, whose -74 dB sidelobes suit a 16-bit datapath.
+    Implemented directly rather than via scipy, so this module depends only
+    on numpy.
+
+    Args:
+        n_taps: Number of taps; must be odd, for exact linear phase.
+        cutoff_norm: Cutoff frequency, normalised as fc/(fs/2), in (0, 1).
+
+    Returns:
+        The filter taps, with unit DC gain.
     """
     if n_taps % 2 == 0:
         raise ValueError("use an odd tap count so the filter is exactly linear phase")
@@ -365,15 +268,17 @@ def fir_taps_quantized(
 ) -> np.ndarray:
     """Quantize taps to `coef_bits`, optionally folding in the 1/K correction.
 
-    Two details that matter more than they look:
+    Any rounding error is absorbed into the largest tap, so the quantized
+    coefficient sum matches the target DC gain exactly.
 
-    * The target DC gain is 1/K when folding, 1 when not (see the K-scaling note
-      in the module docstring).
-    * After rounding, the tap sum drifts off that target by a few LSBs. Left
-      alone that is a small but real DC gain error that shows up as a broadband
-      level offset. The fix -- push the residual onto the largest tap, where it
-      is the smallest relative perturbation -- is the standard one, and is done
-      here so the model and the RTL's coefficient ROM agree exactly.
+    Args:
+        h: Float-precision filter taps, unit DC gain.
+        coef_bits: Target coefficient word width.
+        fold_inv_k: Whether to fold the 1/K correction into the DC gain.
+        k_gain: The CORDIC gain K, used when fold_inv_k is set.
+
+    Returns:
+        The quantized, saturated taps at `coef_bits`.
     """
     target_dc = (1.0 / k_gain) if fold_inv_k else 1.0
     scale = full_scale(coef_bits)
@@ -388,24 +293,23 @@ def fir_taps_quantized(
 
 
 def fir_decimate(xi, xq, coef, decim, coef_bits, acc_bits, out_bits, shift_mode):
-    """Decimating FIR on a complex stream. Returns (i, q, n_saturated).
+    """Run a decimating FIR on a complex stream.
 
-    Written as convolution then subsample. That is numerically identical to the
-    polyphase form the RTL will use -- polyphase is an implementation saving (it
-    never computes the samples it throws away), not a different answer. The
-    model stays in the obvious form so that when RTL and model disagree, the
-    polyphase commutation is a suspect rather than an assumption.
+    Uses valid-only convolution, so every returned sample is a complete
+    filter output with no partial edge samples.
 
-    VALID convolution only: every returned sample is a complete dot product over
-    real input samples. Full-mode convolution would also emit the n_taps-1
-    samples where the filter is running off the end of the buffer, and those are
-    not outputs the hardware ever produces -- an RTL comparison would mismatch
-    on every one of them. They are not merely a transient to be trimmed later;
-    they do not exist. (Their amplitude collapses toward zero, so their phase is
-    meaningless, which is how this was found.)
+    Args:
+        xi, xq: Input I/Q samples.
+        coef: Quantized filter taps.
+        decim: Decimation factor.
+        coef_bits: Coefficient word width.
+        acc_bits: Accumulator width.
+        out_bits: Output word width.
+        shift_mode: TRUNC or ROUND, for the output shift.
 
-    The same argument applies at the start, and valid mode handles it: there is
-    no fill transient in the returned data at all, so callers need no skip.
+    Returns:
+        An (i, q, n_saturated) tuple: decimated output at `out_bits`, and
+        the count of saturated samples across both stages.
     """
     xi = np.asarray(xi, dtype=np.int64)
     xq = np.asarray(xq, dtype=np.int64)
@@ -434,16 +338,98 @@ def fir_decimate(xi, xq, coef, decim, coef_bits, acc_bits, out_bits, shift_mode)
 # --------------------------------------------------------------------------
 
 
+def _validate_modes(cfg: "DDCConfig") -> None:
+    """Validate that mix_arch and shift_mode name a recognised mode.
+
+    Args:
+        cfg: The config being validated.
+
+    Raises:
+        ValueError: If mix_arch or shift_mode is not one of the defined
+            constants.
+    """
+    if cfg.mix_arch not in (MIX_SEPARATE, MIX_FUSED):
+        raise ValueError(f"mix_arch must be {MIX_SEPARATE!r} or {MIX_FUSED!r}")
+    if cfg.shift_mode not in (TRUNC, ROUND):
+        raise ValueError(f"shift_mode must be {TRUNC!r} or {ROUND!r}")
+
+
+def _validate_widths(cfg: "DDCConfig") -> None:
+    """Validate the phase, angle, and datapath bit-width relationships.
+
+    Args:
+        cfg: The config being validated.
+
+    Raises:
+        ValueError: If any width relationship the NCO/CORDIC/mixer datapath
+            depends on is violated.
+    """
+    if cfg.ang_bits > cfg.phase_bits:
+        raise ValueError("ang_bits cannot exceed phase_bits")
+    if cfg.phase_trunc_bits > cfg.phase_bits:
+        raise ValueError("phase_trunc_bits (N) cannot exceed phase_bits (M)")
+    if cfg.phase_trunc_bits < 3:
+        raise ValueError("phase_trunc_bits below 3 cannot even index a quadrant")
+    if cfg.ang_bits < cfg.phase_trunc_bits:
+        raise ValueError(
+            "ang_bits below phase_trunc_bits would truncate the phase a second "
+            "time inside the CORDIC; widen ang_bits or lower N"
+        )
+    if cfg.cordic_bits < cfg.data_bits:
+        raise ValueError("cordic_bits below data_bits throws away input precision")
+    if cfg.mix_arch == MIX_FUSED and cfg.cordic_bits <= cfg.data_bits:
+        raise ValueError(
+            "the fused mixer puts the signal through the CORDIC, so cordic_bits "
+            "must exceed data_bits to leave headroom for the K ~= 1.647 growth"
+        )
+
+
+def _validate_no_aliasing(cfg: "DDCConfig") -> None:
+    """Validate that the FIR cutoff sits below the decimated Nyquist frequency.
+
+    Args:
+        cfg: The config being validated.
+
+    Raises:
+        ValueError: If fir_cutoff is at or above fs_in / (2 * decim).
+    """
+    if cfg.fir_cutoff >= cfg.fs_in / (2 * cfg.decim):
+        raise ValueError(
+            f"cutoff {cfg.fir_cutoff:g} Hz is at or above the decimated Nyquist "
+            f"{cfg.fs_in / (2 * cfg.decim):g} Hz -- the output would alias"
+        )
+
+
+def _validate_cordic_iterations(cfg: "DDCConfig") -> None:
+    """Validate n_iter is neither wasted past ang_bits nor short of convergence.
+
+    Args:
+        cfg: The config being validated.
+
+    Raises:
+        ValueError: If n_iter exceeds what ang_bits can resolve, or is too
+            small for the convergence limit to cover the quadrant residual.
+    """
+    tbl = atan_table(cfg.n_iter, cfg.ang_bits)
+    if int(tbl[-1]) == 0:
+        raise ValueError(
+            f"n_iter={cfg.n_iter} exceeds what ang_bits={cfg.ang_bits} can "
+            f"resolve: the last atan entries are 0, so those stages do nothing"
+        )
+    lim = cordic_convergence_limit(cfg.n_iter)
+    if lim < math.pi / 2:
+        raise ValueError(
+            f"n_iter={cfg.n_iter} gives convergence limit {lim:.4f} rad, below "
+            f"the pi/2 the quadrant range reduction needs"
+        )
+
+
 @dataclass(frozen=True)
 class DDCConfig:
-    """Every number the RTL needs to be parameterised with.
+    """Every value the RTL needs, as a frozen dataclass.
 
-    Defaults target an SDR EM capture of keyboard-controller emissions: a
-    2.4 MS/s complex capture (HackRF's practical floor), a carrier 300 kHz off
-    tune, decimated by 8 to 300 kS/s with a 100 kHz passband. Those are starting
-    points to be re-measured against a real capture, not measured facts -- the
-    front-end's job is to survive being re-tuned, so nothing downstream should
-    assume them.
+    Defaults target a 2.4 MS/s EM capture at a 300 kHz carrier, decimated by
+    8 to a 300 kHz passband.
     """
 
     fs_in: float = 2_400_000.0
@@ -466,47 +452,10 @@ class DDCConfig:
     shift_mode: str = TRUNC
 
     def __post_init__(self):
-        if self.mix_arch not in (MIX_SEPARATE, MIX_FUSED):
-            raise ValueError(f"mix_arch must be {MIX_SEPARATE!r} or {MIX_FUSED!r}")
-        if self.shift_mode not in (TRUNC, ROUND):
-            raise ValueError(f"shift_mode must be {TRUNC!r} or {ROUND!r}")
-        if self.ang_bits > self.phase_bits:
-            raise ValueError("ang_bits cannot exceed phase_bits")
-        if self.phase_trunc_bits > self.phase_bits:
-            raise ValueError("phase_trunc_bits (N) cannot exceed phase_bits (M)")
-        if self.phase_trunc_bits < 3:
-            raise ValueError("phase_trunc_bits below 3 cannot even index a quadrant")
-        if self.ang_bits < self.phase_trunc_bits:
-            raise ValueError(
-                "ang_bits below phase_trunc_bits would truncate the phase a second "
-                "time inside the CORDIC; widen ang_bits or lower N"
-            )
-        if self.cordic_bits < self.data_bits:
-            raise ValueError("cordic_bits below data_bits throws away input precision")
-        if self.mix_arch == MIX_FUSED and self.cordic_bits <= self.data_bits:
-            raise ValueError(
-                "the fused mixer puts the SIGNAL through the CORDIC, so cordic_bits "
-                "must exceed data_bits to leave headroom for the K ~= 1.647 growth"
-            )
-        if self.fir_cutoff >= self.fs_in / (2 * self.decim):
-            raise ValueError(
-                f"cutoff {self.fir_cutoff:g} Hz is at or above the decimated Nyquist "
-                f"{self.fs_in / (2 * self.decim):g} Hz -- the output would alias"
-            )
-        # Beyond ~ang_bits iterations the atan table entries quantize to zero and
-        # the extra stages are pure area for no accuracy.
-        tbl = atan_table(self.n_iter, self.ang_bits)
-        if int(tbl[-1]) == 0:
-            raise ValueError(
-                f"n_iter={self.n_iter} exceeds what ang_bits={self.ang_bits} can "
-                f"resolve: the last atan entries are 0, so those stages do nothing"
-            )
-        lim = cordic_convergence_limit(self.n_iter)
-        if lim < math.pi / 2:
-            raise ValueError(
-                f"n_iter={self.n_iter} gives convergence limit {lim:.4f} rad, below "
-                f"the pi/2 the quadrant range reduction needs"
-            )
+        _validate_modes(self)
+        _validate_widths(self)
+        _validate_no_aliasing(self)
+        _validate_cordic_iterations(self)
 
     @property
     def fs_out(self) -> float:
@@ -520,13 +469,12 @@ class DDCConfig:
 
     @property
     def f_lo_actual(self) -> float:
-        """The LO the hardware actually makes -- phase_inc is an integer.
+        """The LO frequency the hardware actually produces.
 
-        Always report this, never the requested f_lo. With phase_bits=32 the
-        error is sub-milli-Hz and irrelevant; the habit matters because with a
-        narrower accumulator it stops being irrelevant, and a reference model that
-        quietly used the ideal frequency would then disagree with the RTL for a
-        reason nobody could find.
+        Use this instead of the requested f_lo when comparing against RTL.
+
+        Returns:
+            The actual LO frequency in Hz, given the quantized phase_inc.
         """
         return self.phase_inc / (1 << self.phase_bits) * self.fs_in
 
@@ -536,27 +484,24 @@ class DDCConfig:
 
     @property
     def phase_trunc_residue(self) -> int:
-        """FCW bits that fall off the bottom when the phase is truncated to N.
+        """FCW bits discarded when truncating the phase to N bits.
 
-        Zero means this LO produces NO phase-truncation error at all, because
-        the accumulator lands on an exact multiple of the N-bit angle step and
-        the discarded bits are always zero.
+        Zero means this LO exercises no phase-truncation error, so its
+        measured NCO purity should not be quoted as representative.
 
-        That is a trap, not a win. It is the case for every LO that is a binary
-        fraction of the sample rate -- including the 300 kHz / 2.4 MS/s default,
-        where PHASE_INC = 0x20000000 and the low 18 bits are zero. Measure the
-        NCO there and N looks free at any width. Tune 1 kHz away and the
-        truncation spurs appear at their real level. `report()` therefore
-        measures both, and says which case the configured LO is.
+        Returns:
+            The discarded FCW bits; zero if this LO exercises no truncation.
         """
         return self.phase_inc & ((1 << (self.phase_bits - self.phase_trunc_bits)) - 1)
 
     @property
     def phase_trunc_sfdr_bound_db(self) -> float:
-        """Classic worst-case phase-truncation spur bound, ~6.02*N dBc.
+        """Worst-case phase-truncation spur bound, ~6.02*N dBc.
 
-        A ceiling on what the NCO can do, set purely by N. No amount of CORDIC
-        iterations or datapath width buys past it.
+        Depends only on N, not on CORDIC iterations or datapath width.
+
+        Returns:
+            The bound in dBc.
         """
         return 6.02 * self.phase_trunc_bits
 
@@ -564,27 +509,12 @@ class DDCConfig:
     def mix_bits(self) -> int:
         """Width of the mixer output word.
 
-        The fused mixer needs ONE MORE BIT than the separate one, and this is a
-        real cost of the architecture rather than a modelling detail.
+        The fused mixer's output carries the CORDIC gain K > 1, so it needs
+        one more bit than the separate mixer's to avoid overflow.
 
-        Separate: the mixer output is x * exp(-j*theta), magnitude unchanged, so
-        it fits in the same width as the input.
-
-        Fused: the mixer output is K * x * exp(-j*theta), and K ~= 1.6467 > 1.
-        A full-scale input therefore overflows a same-width output. The choices
-        are (a) carry one extra bit here, (b) back the input off by 20*log10(K)
-        = 4.34 dB, or (c) spend a multiplier undoing K -- which would give back
-        exactly the multiplier the fused architecture was supposed to save.
-
-        This model takes (a), because it is the cheapest and because burying the
-        cost in an input back-off would silently hand the fused design 4.3 dB
-        less dynamic range while the SNR comparison still looked fair. Carry the
-        bit into the synthesis study: "fused removes a complex multiplier but
-        widens the mixer output and the FIR input by one bit" is the honest
-        claim, and only the netlist can say which side wins.
-
-        The extra bit is headroom ABOVE full scale -- the LSB weight is
-        unchanged -- so the FIR's output shift does not move.
+        Returns:
+            The mixer output width in bits: data_bits, plus one for the
+            fused architecture.
         """
         return self.data_bits + (1 if self.mix_arch == MIX_FUSED else 0)
 
@@ -595,12 +525,10 @@ class DDCConfig:
 
 
 class DDC:
-    """Bit-exact fixed-point DDC. `run()` returns every intermediate.
+    """Bit-exact fixed-point DDC model.
 
-    Intermediates are returned, not just the output, because that is what makes
-    the model useful for debugging RTL: when the final IQ mismatches you want to
-    know whether the NCO, the mixer, or the FIR diverged, and comparing one
-    stage at a time finds that in one simulation instead of three.
+    `run()` returns every intermediate stage's output, so an RTL mismatch
+    can be localized to one stage.
     """
 
     def __init__(self, cfg: DDCConfig | None = None):
@@ -608,7 +536,6 @@ class DDC:
         c = self.cfg
         self.atan = atan_table(c.n_iter, c.ang_bits)
         self.h_float = firwin_lowpass(c.n_taps, c.fir_cutoff / (c.fs_in / 2))
-        # See the module docstring: separate/fused put the 1/K in different places.
         self.fold_inv_k = c.mix_arch == MIX_FUSED
         self.coef = fir_taps_quantized(
             self.h_float, c.coef_bits, self.fold_inv_k, c.k_gain
@@ -617,35 +544,34 @@ class DDC:
     # -- phase -----------------------------------------------------------
 
     def angle_word(self, phase: np.ndarray) -> np.ndarray:
-        """M-bit accumulator output -> the angle the CORDIC actually receives.
+        """Convert the M-bit accumulator phase to the CORDIC's angle input.
 
-        Two steps, and keeping them distinct is the whole point of having both
-        M and N:
+        Truncates to N bits, then zero-pads to ang_bits so the CORDIC
+        converges without re-quantizing. Shared by the NCO and the fused
+        mixer.
 
-          1. TRUNCATE the M-bit accumulator to N bits. This throws information
-             away and is what creates phase-truncation spurs. It is the step
-             that N controls.
-          2. ZERO-PAD back up to ang_bits, the CORDIC's internal angle width.
-             This adds no information and no error -- it just gives the rotation
-             room to converge on the truncated angle rather than quantizing it a
-             second time.
+        Args:
+            phase: M-bit phase accumulator values.
 
-        Collapsing these into one number (using N as the CORDIC's z width too)
-        would conflate a spectral-purity choice with an arithmetic-precision
-        one, and would cap the useful iteration count at 13 for N=14 -- past
-        that the atan table entries round to zero and the stages do nothing.
-
-        Both the NCO and the fused mixer call this, so they cannot drift apart.
+        Returns:
+            The ang_bits-wide angle word the CORDIC receives.
         """
         c = self.cfg
         truncated = shr(phase, c.phase_bits - c.phase_trunc_bits)
         return truncated << np.int64(c.ang_bits - c.phase_trunc_bits)
 
     def phase(self, n: int, phase0: int = 0, inc: int | None = None) -> np.ndarray:
-        """Phase accumulator output: (phase0 + n*inc) mod 2**phase_bits.
+        """Compute phase accumulator output: (phase0 + n*inc) mod 2**phase_bits.
 
-        `inc` overrides the configured FCW, which report() uses to measure the
-        NCO at an LO that actually exercises phase truncation.
+        Args:
+            n: Number of samples to generate.
+            phase0: Initial phase.
+            inc: FCW to use instead of the configured one; `report()` uses
+                this to measure the NCO at an LO that exercises phase
+                truncation.
+
+        Returns:
+            The phase accumulator sequence, one value per sample.
         """
         c = self.cfg
         mask = (1 << c.phase_bits) - 1
@@ -653,13 +579,17 @@ class DDC:
         return (phase0 + np.arange(n, dtype=np.int64) * step) & mask
 
     def nco(self, phase: np.ndarray):
-        """Phase word -> (cos, sin) at data_bits, unit amplitude.
+        """Convert a phase word to (cos, sin) at data_bits, unit amplitude.
 
-        The 1/K seed is what makes the output unit amplitude without a
-        multiplier. Note the deliberate saturation: cos(0) wants to be exactly
-        +1.0, which a signed word cannot represent, so it saturates to
-        full_scale-1. That one-LSB asymmetry is a genuine property of the
-        hardware and the model reproduces it rather than rounding it away.
+        Saturates at full_scale-1 rather than +1.0, since a signed word
+        cannot represent exactly 1.0.
+
+        Args:
+            phase: Angle-domain phase values, at the accumulator's M-bit
+                width.
+
+        Returns:
+            A (cos, sin) tuple, each at data_bits.
         """
         c = self.cfg
         q, rem = quadrant_split(self.angle_word(phase), c.ang_bits)
@@ -675,11 +605,17 @@ class DDC:
     # -- mixers ----------------------------------------------------------
 
     def mix_separate(self, xi, xq, cos, sin):
-        """(xi + j*xq) * (cos - j*sin), four real multiplies.
+        """Mix (xi + j*xq) with (cos - j*sin), four real multiplies.
 
-        The conjugate is the down-conversion. With a real input (xq == 0) two of
-        the four multiplies drop out, which is worth remembering when comparing
-        gate counts against the fused path.
+        Multiplies by the NCO's conjugate to down-convert. With a real
+        input, two of the four multiplies are zero.
+
+        Args:
+            xi, xq: Input I/Q samples, at data_bits.
+            cos, sin: NCO output, at data_bits.
+
+        Returns:
+            A (i, q) tuple of mixed output, each at data_bits.
         """
         c = self.cfg
         xi = np.asarray(xi, np.int64)
@@ -694,19 +630,23 @@ class DDC:
         )
 
     def mix_fused(self, xi, xq, phase):
-        """Rotate the input vector by -theta directly: the rotation IS the mix.
+        """Rotate the input vector by -theta directly: the rotation is the mix.
 
-        No complex multiplier at all. The cost is that the CORDIC is now in the
-        signal path rather than off to the side generating a carrier, so its
-        width is set by the signal's dynamic range, and its output carries the K
-        gain (removed downstream in the FIR coefficients).
+        No complex multiplier at all. The CORDIC output carries the gain K,
+        removed later in the FIR coefficients.
+
+        Args:
+            xi, xq: Input I/Q samples, at data_bits.
+            phase: Accumulator phase for each sample.
+
+        Returns:
+            A (i, q) tuple of mixed output, each at mix_bits.
         """
         c = self.cfg
         q, rem = quadrant_split(self.angle_word(phase), c.ang_bits)
         ri, rq = prerotate_conj(q, np.asarray(xi, np.int64), np.asarray(xq, np.int64))
-        # Shift up by one LESS than the available guard, so the K growth has a
-        # bit to grow into. Using the full guard would put a full-scale input at
-        # the top of the CORDIC word and K would saturate it on iteration one.
+        # Leaves one guard bit for the K growth, so a full-scale input does
+        # not saturate on the first iteration.
         g = c.cordic_bits - c.data_bits - 1
         n_pre = would_saturate(ri << np.int64(g), c.cordic_bits)
         x, y, _ = cordic_rotate(
@@ -721,7 +661,18 @@ class DDC:
     # -- top level -------------------------------------------------------
 
     def run(self, xi, xq=None, phase0: int = 0) -> dict:
-        """Full DDC. Real input is accepted as xq=None (the common EM case)."""
+        """Run the full DDC over a stimulus.
+
+        Args:
+            xi: Input I samples, at data_bits.
+            xq: Input Q samples, at data_bits. None for a real input (the
+                common EM case), in which case Q is treated as zero.
+            phase0: Initial NCO phase.
+
+        Returns:
+            A dict of every stage's output: phase, cos, sin, mix_i, mix_q,
+            out_i, out_q, stim_i, stim_q, and n_saturated.
+        """
         c = self.cfg
         xi = sat(np.asarray(xi, np.int64), c.data_bits)
         xq = np.zeros_like(xi) if xq is None else sat(np.asarray(xq, np.int64), c.data_bits)
@@ -757,25 +708,28 @@ class DDC:
 
 
 def ddc_ideal(xi, xq, cfg: DDCConfig, h: np.ndarray, phase0: int = 0):
-    """Float64 DDC: what the answer should be, with no quantization anywhere.
+    """Compute the float64 DDC output: the intended answer, with no quantization.
 
-    Input is integers at cfg.data_bits; output is NORMALISED so that 1.0 means
-    full scale. The fixed-point model's output is normalised the same way, so
-    the two are directly comparable -- an un-normalised reference is a 90 dB
-    error that looks like a catastrophic datapath bug.
+    Normalized so full scale is 1.0, matching the fixed-point model's scale.
+    Uses the actual quantized LO frequency and the float filter taps, so
+    the result isolates datapath error from LO placement and filter design.
 
-    Uses cfg.f_lo_actual rather than cfg.f_lo, so a frequency the accumulator
-    cannot represent is not scored as a quantization error of the datapath.
-    Uses the FLOAT taps, so the metric isolates datapath quantization from
-    filter shape -- otherwise coefficient rounding would be double-counted.
+    Args:
+        xi, xq: Input I/Q samples, integers at cfg.data_bits.
+        cfg: The DDC configuration.
+        h: Float-precision FIR taps.
+        phase0: Initial NCO phase.
+
+    Returns:
+        The normalised complex baseband output, decimated and valid-only.
     """
     x = (np.asarray(xi, float) + 1j * np.asarray(xq, float)) / full_scale(cfg.data_bits)
     n = np.arange(len(x))
     ph = 2 * np.pi * cfg.f_lo_actual / cfg.fs_in * n + 2 * np.pi * phase0 / (
         1 << cfg.phase_bits
     )
-    # Valid-only and the same decimation phase as fir_decimate -- the two models
-    # have to be sample-aligned or the SNR comparison is measuring a delay.
+    # Same valid-only convolution and decimation phase as fir_decimate, so
+    # the two models stay sample-aligned.
     y = np.convolve(x * np.exp(-1j * ph), h, mode="valid")[:: cfg.decim]
     return y
 
@@ -786,10 +740,15 @@ def ddc_ideal(xi, xq, cfg: DDCConfig, h: np.ndarray, phase0: int = 0):
 
 
 def snr_db(ref: np.ndarray, test: np.ndarray, skip: int = 0) -> float:
-    """SNR of `test` against `ref`, both complex, in dB.
+    """Compute the SNR of `test` against `ref`, both complex, in dB.
 
-    `skip` drops leading samples so the filter's fill transient -- which is a
-    real difference but not an error -- does not dominate the number.
+    Args:
+        ref: Reference signal.
+        test: Signal under test.
+        skip: Leading samples to drop before scoring.
+
+    Returns:
+        SNR in dB, or inf if the two signals are identical.
     """
     r, t = ref[skip:], test[skip:]
     p_sig = float(np.mean(np.abs(r) ** 2))
@@ -800,33 +759,25 @@ def snr_db(ref: np.ndarray, test: np.ndarray, skip: int = 0) -> float:
 
 
 def sfdr_db(y: np.ndarray, skip: int = 0) -> float:
-    """Spurious-free dynamic range of a SINGLE-TONE output, in dB.
+    """Compute the spurious-free dynamic range of a single-tone output, in dB.
 
-    Carrier bin vs the largest other bin. This is the number that actually
-    catches an NCO problem: phase-truncation spurs and atan-table quantization
-    show up here long before they move an SNR figure.
+    Compares the carrier bin against the largest other bin. Requires a
+    single-tone input. On a two-tone stimulus the largest other bin is just
+    the second tone.
 
-    Single tone is not a suggestion. Feed this a two-tone stimulus and the
-    "largest spur" it finds is the second tone, so it reports ~0 dB and tells
-    you nothing. `report()` therefore measures SNR on the two-tone case (which
-    needs the second tone, to catch a mirrored spectrum) and SFDR on a separate
-    single-tone run.
+    Args:
+        y: Complex output signal, single-tone.
+        skip: Leading samples to drop.
+
+    Returns:
+        SFDR in dB, nan if too few samples remain, inf if no spur is found.
     """
     y = y[skip:]
     if len(y) < 64:
         return float("nan")
 
-    # Four-term Blackman-Harris, not Hanning. The tone will not land exactly on
-    # an FFT bin -- the output length is set by the decimation, not chosen to
-    # make the tone coherent -- so an off-bin tone leaks into its neighbours and
-    # the "worst spur" found is that leakage rather than anything the hardware
-    # did. Hanning's -31 dB first sidelobe puts that floor around 40 dB, which
-    # is well above the ~58 dB spurs actually being looked for: the measurement
-    # would report the window.
-    #
-    # Blackman-Harris has -92 dB sidelobes, comfortably below the real spurs, at
-    # the cost of a wider main lobe -- hence the 8-bin guard below, which is what
-    # that main lobe spans.
+    # Blackman-Harris window: -92 dB sidelobes keep off-bin leakage below the
+    # spurs being measured. The 8-bin guard matches its wider main lobe.
     n = len(y)
     m_ = np.arange(n)
     a = (0.35875, 0.48829, 0.14128, 0.01168)
@@ -859,7 +810,19 @@ def effective_bits(snr: float) -> float:
 
 
 def tone(n: int, fs: float, f: float, amp_dbfs: float, bits: int, phase: float = 0.0):
-    """Complex tone at `f` Hz, quantized to `bits`. Returns (i, q) integers."""
+    """Generate a complex tone at `f` Hz, quantized to `bits`.
+
+    Args:
+        n: Number of samples.
+        fs: Sample rate in Hz.
+        f: Tone frequency in Hz.
+        amp_dbfs: Amplitude relative to full scale, in dB.
+        bits: Output word width.
+        phase: Starting phase in radians.
+
+    Returns:
+        An (i, q) tuple of integer samples at `bits`.
+    """
     a = full_scale(bits) * (10.0 ** (amp_dbfs / 20.0))
     t = np.arange(n)
     z = a * np.exp(1j * (2 * np.pi * f / fs * t + phase))
@@ -870,11 +833,19 @@ def tone(n: int, fs: float, f: float, amp_dbfs: float, bits: int, phase: float =
 
 
 def two_tone(n: int, cfg: DDCConfig, offsets=(25_000.0, -60_000.0), amp_dbfs=-6.0):
-    """In-band tone plus a second one, both offset from the LO.
+    """Generate an in-band tone plus a second one, both offset from the LO.
 
-    The negative offset is the point: it is the test that fails loudly if the
-    conjugate is backwards, because a mirrored spectrum swaps the two tones and
-    nothing else about the output looks wrong.
+    Includes one negative-offset tone, so a mirrored spectrum swaps the two
+    tones instead of passing silently.
+
+    Args:
+        n: Number of samples.
+        cfg: The DDC configuration, for fs_in, f_lo_actual, and data_bits.
+        offsets: Frequency offsets from the LO, in Hz.
+        amp_dbfs: Combined amplitude relative to full scale, in dB.
+
+    Returns:
+        An (i, q) tuple of integer samples at cfg.data_bits.
     """
     zi = np.zeros(n, np.int64)
     zq = np.zeros(n, np.int64)
@@ -891,18 +862,46 @@ def two_tone(n: int, cfg: DDCConfig, offsets=(25_000.0, -60_000.0), amp_dbfs=-6.
 
 
 def _hex_lines(a: np.ndarray, bits: int) -> list[str]:
-    """Two's-complement hex, one value per line, for $readmemh."""
+    """Format values as two's-complement hex, one per line, for $readmemh.
+
+    Args:
+        a: Values to format.
+        bits: Word width.
+
+    Returns:
+        One hex string per value, zero-padded to the word width.
+    """
     mask = (1 << bits) - 1
     nib = (bits + 3) // 4
     return [format(int(v) & mask, f"0{nib}x") for v in np.asarray(a).ravel()]
 
 
+def _write_hex_files(out_dir: str, files: dict) -> None:
+    """Write each array in `files` to its own $readmemh-style hex file.
+
+    Args:
+        out_dir: Directory to write into.
+        files: Maps file name to an (array, bits) pair.
+    """
+    for name, (arr, bits) in files.items():
+        with open(os.path.join(out_dir, name), "w", newline="\n") as f:
+            f.write("\n".join(_hex_lines(arr, bits)) + "\n")
+
+
 def emit_vectors(ddc: DDC, out_dir: str, n: int = 4096) -> dict:
     """Write stimulus, per-stage expected values, and the RTL parameter header.
 
-    The testbench reads these rather than recomputing the reference. A testbench
-    that recomputes is only testing that two of your own implementations agree,
-    which is exactly the failure mode where both share the same sign error.
+    The testbench reads these values rather than recomputing them, so a
+    sign error shared by both implementations cannot hide.
+
+    Args:
+        ddc: The DDC model to generate vectors from.
+        out_dir: Directory to write the hex files, params header, and
+            manifest into.
+        n: Stimulus length in samples.
+
+    Returns:
+        The manifest dict that was also written to manifest.json.
     """
     c = ddc.cfg
     os.makedirs(out_dir, exist_ok=True)
@@ -920,9 +919,7 @@ def emit_vectors(ddc: DDC, out_dir: str, n: int = 4096) -> dict:
         "out_q.hex": (r["out_q"], c.out_bits),
         "fir_coef.hex": (ddc.coef, c.coef_bits),
     }
-    for name, (arr, bits) in files.items():
-        with open(os.path.join(out_dir, name), "w", newline="\n") as f:
-            f.write("\n".join(_hex_lines(arr, bits)) + "\n")
+    _write_hex_files(out_dir, files)
 
     svh = os.path.join(out_dir, "ddc_params.svh")
     with open(svh, "w", newline="\n") as f:
@@ -949,6 +946,16 @@ def emit_vectors(ddc: DDC, out_dir: str, n: int = 4096) -> dict:
 
 
 def _params_svh(ddc: DDC, n_in: int, n_out: int) -> str:
+    """Render the RTL parameter header for the given DDC configuration.
+
+    Args:
+        ddc: The DDC model the parameters are drawn from.
+        n_in: Stimulus length in samples, for the N_STIM localparam.
+        n_out: Output length in samples, for the N_OUT localparam.
+
+    Returns:
+        The contents of ddc_params.svh as a string.
+    """
     c = ddc.cfg
     return f"""// Generated by hardware/reference/ddc_reference.py -- do not edit by hand.
 // Regenerate:  python hardware/reference/ddc_reference.py --emit-vectors <dir>
@@ -982,7 +989,7 @@ localparam int DECIM       = {c.decim};
 // Phase accumulator increment for f_lo = {c.f_lo:.0f} Hz at fs = {c.fs_in:.0f} Hz.
 // The LO the hardware actually produces is {c.f_lo_actual:.6f} Hz.
 // Bits falling below the N-bit truncation point: {c.phase_trunc_residue}.
-// {"NOTE: zero -- this LO is a binary fraction of fs, so it exercises NO phase" if c.phase_trunc_residue == 0 else "This LO exercises phase truncation, so the spurs are real here."}
+// {"Note: zero -- this LO is a binary fraction of fs, so it exercises no phase" if c.phase_trunc_residue == 0 else "This LO exercises phase truncation, so the spurs are real here."}
 // {"truncation at all. Do not characterise the NCO at this LO alone." if c.phase_trunc_residue == 0 else ""}
 localparam logic [PHASE_BITS-1:0] PHASE_INC = {c.phase_bits}'h{c.phase_inc:0{(c.phase_bits + 3) // 4}x};
 
@@ -1007,44 +1014,81 @@ localparam int N_OUT  = {n_out};
 # --------------------------------------------------------------------------
 
 
-def report(cfg: DDCConfig, n: int = 8192) -> dict:
-    ddc = DDC(cfg)
-    xi, xq = two_tone(n, cfg)
-    r = ddc.run(xi, xq)
-    ref = ddc_ideal(xi, xq, cfg, ddc.h_float)
+def _measure_nco_purity(ddc: DDC, cfg: DDCConfig, n: int) -> dict:
+    """Measure NCO spectral purity at the configured LO and at a harder one.
 
-    fixed = (r["out_i"] + 1j * r["out_q"]).astype(complex) / full_scale(cfg.out_bits)
+    Args:
+        ddc: The DDC model to measure.
+        cfg: The DDC configuration.
+        n: Number of NCO samples to generate.
 
-    # SFDR needs a single tone -- see sfdr_db(). Separate run, offset well off
-    # both DC and the band edge so neither the filter skirt nor a DC term is
-    # mistaken for a spur.
-    si, sq = tone(n, cfg.fs_in, cfg.f_lo_actual + 37_000.0, -6.0, cfg.data_bits)
-    rs = ddc.run(si, sq)
-    single = (rs["out_i"] + 1j * rs["out_q"]).astype(complex) / full_scale(cfg.out_bits)
-    # The fused path's K lives in the coefficients, so both land on the same
-    # scale as the ideal model, which has no K at all. Nothing to undo here --
-    # if this ever needs a fudge factor, the K accounting has drifted.
-    #
-    # No skip: fir_decimate returns valid-convolution output only, so there is
-    # no fill transient to trim on either end.
-    skip = 0
-
-    # NCO measured on its own: the carrier's own purity, independent of the
-    # signal path, which is where phase-truncation spurs actually live.
+    Returns:
+        A dict with nco_snr_db, nco_sfdr_db, nco_sfdr_hard_lo_db, and
+        hard_lo_hz.
+    """
+    # Purity at the configured LO, independent of the signal path.
     ph = ddc.phase(n)
     cos, sin = ddc.nco(ph)
     nco_c = (cos + 1j * sin).astype(complex) / full_scale(cfg.data_bits)
     ideal_nco = np.exp(1j * 2 * np.pi * cfg.f_lo_actual / cfg.fs_in * np.arange(n))
 
-    # And again at an LO chosen to exercise phase truncation. The configured LO
-    # may well be a binary fraction of fs (the default is), in which case the
-    # discarded bits are always zero and N looks free at any width. Setting a
-    # spread of low FCW bits is what makes the N-bit truncation actually bite --
-    # this is the number that reflects what a real tuning will do.
+    # And at an LO whose FCW has nonzero low bits, so truncation actually
+    # occurs.
     hard_inc = (cfg.phase_inc + 0x0002AAAB) & ((1 << cfg.phase_bits) - 1)
     hard_cos, hard_sin = ddc.nco(ddc.phase(n, inc=hard_inc))
     hard_c = (hard_cos + 1j * hard_sin).astype(complex) / full_scale(cfg.data_bits)
 
+    return {
+        "nco_snr_db": snr_db(ideal_nco, nco_c),
+        "nco_sfdr_db": sfdr_db(nco_c),
+        "nco_sfdr_hard_lo_db": sfdr_db(hard_c),
+        "hard_lo_hz": hard_inc / (1 << cfg.phase_bits) * cfg.fs_in,
+    }
+
+
+def _measure_ddc_quality(ddc: DDC, cfg: DDCConfig, n: int) -> dict:
+    """Measure the fixed-point DDC's SNR/SFDR against the ideal model.
+
+    Args:
+        ddc: The DDC model to measure.
+        cfg: The DDC configuration.
+        n: Stimulus length in samples.
+
+    Returns:
+        A dict with ddc_snr_db, ddc_enob, ddc_sfdr_db, and n_saturated.
+    """
+    xi, xq = two_tone(n, cfg)
+    r = ddc.run(xi, xq)
+    ref = ddc_ideal(xi, xq, cfg, ddc.h_float)
+    fixed = (r["out_i"] + 1j * r["out_q"]).astype(complex) / full_scale(cfg.out_bits)
+
+    # SFDR needs a single tone, measured separately at an offset away from
+    # DC and the band edge.
+    si, sq = tone(n, cfg.fs_in, cfg.f_lo_actual + 37_000.0, -6.0, cfg.data_bits)
+    rs = ddc.run(si, sq)
+    single = (rs["out_i"] + 1j * rs["out_q"]).astype(complex) / full_scale(cfg.out_bits)
+
+    skip = 0
+    snr = snr_db(ref, fixed, skip)
+    return {
+        "ddc_snr_db": snr,
+        "ddc_enob": effective_bits(snr),
+        "ddc_sfdr_db": sfdr_db(single, skip),
+        "n_saturated": r["n_saturated"] + rs["n_saturated"],
+    }
+
+
+def report(cfg: DDCConfig, n: int = 8192) -> dict:
+    """Measure and collect the DDC's key SNR/SFDR figures for one config.
+
+    Args:
+        cfg: The DDC configuration to measure.
+        n: Stimulus length in samples.
+
+    Returns:
+        A dict of the figures printed by `_print_report()`.
+    """
+    ddc = DDC(cfg)
     out = {
         "fs_out": cfg.fs_out,
         "f_lo_actual": cfg.f_lo_actual,
@@ -1052,22 +1096,22 @@ def report(cfg: DDCConfig, n: int = 8192) -> dict:
         "k_gain": cfg.k_gain,
         "inv_k_in_coefficients": ddc.fold_inv_k,
         "coef_dc_gain": float(ddc.coef.sum()) / full_scale(cfg.coef_bits),
-        "nco_snr_db": snr_db(ideal_nco, nco_c),
-        "nco_sfdr_db": sfdr_db(nco_c),
-        "nco_sfdr_hard_lo_db": sfdr_db(hard_c),
-        "hard_lo_hz": hard_inc / (1 << cfg.phase_bits) * cfg.fs_in,
         "phase_trunc_residue": cfg.phase_trunc_residue,
         "phase_trunc_bound_db": cfg.phase_trunc_sfdr_bound_db,
-        "ddc_snr_db": snr_db(ref, fixed, skip),
-        "ddc_enob": effective_bits(snr_db(ref, fixed, skip)),
-        "ddc_sfdr_db": sfdr_db(single, skip),
-        "n_saturated": r["n_saturated"] + rs["n_saturated"],
         "convergence_limit_rad": cordic_convergence_limit(cfg.n_iter),
     }
+    out.update(_measure_nco_purity(ddc, cfg, n))
+    out.update(_measure_ddc_quality(ddc, cfg, n))
     return out
 
 
 def _print_report(cfg: DDCConfig, m: dict) -> None:
+    """Print the figures from `report()` in human-readable form.
+
+    Args:
+        cfg: The DDC configuration the figures were measured under.
+        m: The dict returned by `report(cfg, ...)`.
+    """
     print(f"  mixer architecture     {cfg.mix_arch}")
     print(f"  shift mode             {cfg.shift_mode}")
     print(f"  fs in / out            {cfg.fs_in / 1e6:.3f} MS/s -> {m['fs_out'] / 1e3:.1f} kS/s  (/{cfg.decim})")
@@ -1089,17 +1133,62 @@ def _print_report(cfg: DDCConfig, m: dict) -> None:
     print(f"  NCO   SNR {m['nco_snr_db']:7.2f} dB    SFDR {m['nco_sfdr_db']:7.2f} dB "
           f"(at the configured LO)")
     if m["phase_trunc_residue"] == 0:
-        print(f"        ^ this LO is a binary fraction of fs, so NO phase truncation")
+        print(f"        ^ this LO is a binary fraction of fs, so no phase truncation")
         print(f"          occurs and N={cfg.phase_trunc_bits} costs nothing here. Do not")
         print(f"          quote this figure as the NCO's spectral purity.")
     print(f"  NCO   SFDR {m['nco_sfdr_hard_lo_db']:6.2f} dB at {m['hard_lo_hz'] / 1e3:.3f} kHz "
-          f"-- an LO that DOES exercise the N-bit truncation")
+          f"-- an LO that does exercise the N-bit truncation")
     print(f"  DDC   SNR {m['ddc_snr_db']:7.2f} dB    SFDR {m['ddc_sfdr_db']:7.2f} dB    ENOB {m['ddc_enob']:.2f} bits")
     if m["n_saturated"]:
         print(f"  !! {m['n_saturated']} samples saturated -- back the input off or widen the datapath")
 
 
+def _run_compare_arch(cfg: DDCConfig, n: int) -> None:
+    """Print the separate and fused architectures side by side.
+
+    Args:
+        cfg: Base configuration; mix_arch is overridden per architecture.
+        n: Stimulus length in samples.
+    """
+    print("DDC reference model -- architecture comparison\n")
+    results = {}
+    for arch in (MIX_SEPARATE, MIX_FUSED):
+        c = replace(cfg, mix_arch=arch)
+        results[arch] = report(c, n)
+        print(f"[{arch}]")
+        _print_report(c, results[arch])
+        print()
+    d = results[MIX_FUSED]["ddc_snr_db"] - results[MIX_SEPARATE]["ddc_snr_db"]
+    print(f"  fused - separate: {d:+.2f} dB SNR")
+    print("  The synthesis comparison is only meaningful at matched SNR. If this")
+    print("  gap is large, equalise it (usually via cordic_bits) before comparing")
+    print("  area -- otherwise you are comparing a cheap design to an accurate one.")
+
+
+def _run_emit_vectors(cfg: DDCConfig, out_dir: str, n: int) -> None:
+    """Write RTL test vectors and print a summary of what was written.
+
+    Args:
+        cfg: Configuration to generate vectors for.
+        out_dir: Destination directory.
+        n: Stimulus length in samples.
+    """
+    man = emit_vectors(DDC(cfg), out_dir, n)
+    d = man["derived"]
+    print(f"\nwrote {len(man['files'])} files to {out_dir}")
+    print(f"  {d['n_input_samples']} input samples -> {d['n_output_samples']} output samples")
+    print(f"  phase_inc = 0x{d['phase_inc']:08x}, K = {d['k_gain']:.10f}")
+
+
 def main(argv=None) -> int:
+    """Run the CLI: parse arguments and dispatch to report/compare/emit.
+
+    Args:
+        argv: Argument list to parse; defaults to sys.argv[1:].
+
+    Returns:
+        Process exit code.
+    """
     p = argparse.ArgumentParser(
         description="Numpy reference model of the DDC front-end.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -1132,19 +1221,7 @@ def main(argv=None) -> int:
     did = False
     if a.compare_arch:
         did = True
-        print("DDC reference model -- architecture comparison\n")
-        results = {}
-        for arch in (MIX_SEPARATE, MIX_FUSED):
-            c = replace(cfg, mix_arch=arch)
-            results[arch] = report(c, a.n)
-            print(f"[{arch}]")
-            _print_report(c, results[arch])
-            print()
-        d = results[MIX_FUSED]["ddc_snr_db"] - results[MIX_SEPARATE]["ddc_snr_db"]
-        print(f"  fused - separate: {d:+.2f} dB SNR")
-        print("  The synthesis comparison is only meaningful at matched SNR. If this")
-        print("  gap is large, equalise it (usually via cordic_bits) BEFORE comparing")
-        print("  area -- otherwise you are comparing a cheap design to an accurate one.")
+        _run_compare_arch(cfg, a.n)
     elif a.report:
         did = True
         print("DDC reference model\n")
@@ -1152,11 +1229,7 @@ def main(argv=None) -> int:
 
     if a.emit_vectors:
         did = True
-        man = emit_vectors(DDC(cfg), a.emit_vectors, a.n)
-        d = man["derived"]
-        print(f"\nwrote {len(man['files'])} files to {a.emit_vectors}")
-        print(f"  {d['n_input_samples']} input samples -> {d['n_output_samples']} output samples")
-        print(f"  phase_inc = 0x{d['phase_inc']:08x}, K = {d['k_gain']:.10f}")
+        _run_emit_vectors(cfg, a.emit_vectors, a.n)
 
     if not did:
         p.print_help()

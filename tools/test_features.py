@@ -1,15 +1,7 @@
-"""Tiny synthetic-data test for features.py.
+"""Synthetic-data tests for features.py.
 
-Proves the core path works before we move on to File 3:
-  * mel filterbank / numpy mel path produces the right shapes and a sane
-    log-mel image (finite, normalized to [0,1]),
-  * if librosa is installed, the pure-numpy mel path matches it numerically
-    (Slaney norm + center padding are the whole point of that requirement),
-  * time_shift is zero-filled, not circular (the tail/head must go to exact
-    zero, not wrap the original signal around),
-  * spec_augment masks ~10%/axis to the image mean, 2 masks per axis,
-  * build_dataset skips empty label groups and raises on mixed sample rates,
-  * dataset save/load round-trips X, Y, and labels.
+Covers the mel spectrogram backend, augmentation, dataset building, and
+save/load round-tripping.
 
 Run:  python test_features.py
 """
@@ -38,6 +30,13 @@ import isolate_keystrokes as ik
 
 
 def write_float_wav(path, x, sr):
+    """Write a mono 32-bit float WAV file.
+
+    Args:
+        path: Output file path.
+        x: 1-D float array of samples.
+        sr: Sample rate in Hz.
+    """
     data = x.astype("<f4").tobytes()
     fmt, ch, bits = 3, 1, 32
     byte_rate = sr * ch * bits // 8
@@ -50,7 +49,16 @@ def write_float_wav(path, x, sr):
 
 
 def synth_clip(sr, n, seed=0):
-    """A short decaying-noise burst, similar to a real keystroke clip."""
+    """Build a short decaying-noise burst, similar to a real keystroke clip.
+
+    Args:
+        sr: Sample rate in Hz.
+        n: Clip length in samples.
+        seed: Seed for the burst's random generator.
+
+    Returns:
+        A 1-D float32 array of length n.
+    """
     rng = np.random.default_rng(seed)
     x = (rng.standard_normal(n) * 0.003).astype(np.float32)
     burst_n = min(n, int(0.03 * sr))
@@ -62,6 +70,7 @@ def synth_clip(sr, n, seed=0):
 
 
 def test_backend_shapes():
+    """Verify melspectrogram and clip_to_logmel_image produce correctly shaped, finite, normalized output."""
     sr = 48000
     x = synth_clip(sr, ik.CLIP_LEN, seed=0)
 
@@ -78,6 +87,7 @@ def test_backend_shapes():
 
 
 def test_numpy_matches_librosa():
+    """Verify the pure-numpy mel path matches librosa's, when librosa is installed."""
     try:
         import librosa  # noqa: F401
     except ImportError:
@@ -91,7 +101,7 @@ def test_numpy_matches_librosa():
     mel_lr = ft.melspectrogram_librosa(x, sr)
 
     assert mel_np.shape == mel_lr.shape, f"shape mismatch {mel_np.shape} vs {mel_lr.shape}"
-    # Compare on a relative scale since absolute power values can be tiny.
+    # Compared on a relative scale since absolute power values can be tiny.
     scale = max(float(np.max(np.abs(mel_lr))), 1e-8)
     rel_diff = float(np.max(np.abs(mel_np - mel_lr))) / scale
     assert rel_diff < 1e-3, f"numpy mel diverges from librosa: rel_diff={rel_diff}"
@@ -99,19 +109,20 @@ def test_numpy_matches_librosa():
 
 
 def test_time_shift_zero_filled():
+    """Verify time_shift fills the vacated edge with exact zeros rather than wrapping the signal."""
     rng = np.random.default_rng(0)
     n = 1000
-    x = np.ones(n, dtype=np.float32)  # all-ones so wrap-vs-zero is obvious
+    x = np.ones(n, dtype=np.float32)  # constant signal makes any wrap-around obvious
 
-    # Force a large positive shift by seeding until we get one, then check head is zero.
+    # Reseed up to 50 times to force a shift that actually leaves a zero-filled region.
     for _ in range(50):
         shifted = ft.time_shift(x, max_frac=0.4, rng=rng)
         nz = np.flatnonzero(shifted == 0.0)
         if len(nz) > 0:
             break
     assert len(nz) > 0, "expected some zero-filled region from a nonzero shift"
-    # The zero region must be a contiguous run at one end, not scattered (which
-    # would indicate a wrap/circular artifact instead of a clean zero-fill).
+    # The zero region must be one contiguous run at an edge, not scattered points,
+    # since scattered zeros would indicate a wrap instead of a clean zero-fill.
     z = (shifted == 0.0)
     at_start = z[: len(nz)].all() if z[0] else False
     at_end = z[-len(nz):].all() if z[-1] else False
@@ -121,6 +132,7 @@ def test_time_shift_zero_filled():
 
 
 def test_spec_augment_masks_to_mean():
+    """Verify spec_augment overwrites masked rows/columns with the image's mean value."""
     rng = np.random.default_rng(0)
     img = np.random.default_rng(1).uniform(0.2, 0.8, size=(ft.N_MELS, ft.IMG_SIZE)).astype(np.float32)
     mean_val = float(img.mean())
@@ -131,7 +143,7 @@ def test_spec_augment_masks_to_mean():
     diff_cols = np.flatnonzero(np.any(out != img, axis=0))
     assert len(diff_rows) > 0 or len(diff_cols) > 0, "spec_augment changed nothing"
 
-    # Any row that was fully overwritten should now be all mean_val.
+    # Any row or column fully overwritten by the mask should now equal mean_val throughout.
     full_mean_rows = [r for r in diff_rows if np.allclose(out[r], mean_val)]
     full_mean_cols = [c for c in diff_cols if np.allclose(out[:, c], mean_val)]
     assert len(full_mean_rows) > 0 or len(full_mean_cols) > 0, "no fully-masked row/col found at mean value"
@@ -139,6 +151,7 @@ def test_spec_augment_masks_to_mean():
 
 
 def test_build_dataset_skips_empty_and_checks_sr():
+    """Verify build_dataset labels/shapes clips correctly and raises on mixed sample rates."""
     sr = 48000
     with tempfile.TemporaryDirectory() as tmp:
         clips = os.path.join(tmp, "clips")
@@ -158,7 +171,7 @@ def test_build_dataset_skips_empty_and_checks_sr():
         assert set(Y.tolist()) == {0, 1}, "expected both classes present"
         print("build_dataset: shapes/labels OK, empty groups skipped (none present)")
 
-        # Now inject a clip at a different sample rate -> must raise.
+        # A clip at a different sample rate must be rejected.
         x_bad = synth_clip(44100, ik.CLIP_LEN, seed=99)
         write_float_wav(os.path.join(clips, "a_99.wav"), x_bad, 44100)
         try:
@@ -171,6 +184,7 @@ def test_build_dataset_skips_empty_and_checks_sr():
 
 
 def test_save_load_roundtrip():
+    """Verify save_dataset/load_dataset round-trip X, Y, and labels unchanged."""
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "dataset.npz")
         X = np.random.default_rng(0).uniform(0, 1, size=(4, ft.N_MELS, ft.IMG_SIZE)).astype(np.float32)
@@ -187,11 +201,9 @@ def test_save_load_roundtrip():
 
 
 def test_pool_grows_across_sessions():
-    """A second recording session must ADD to the pool, not replace it.
+    """Verify a second recording session adds to the clip pool instead of replacing it.
 
-    This is the whole basis of the growing-pool strategy: sessions live in
-    their own subdirectories, build_dataset scans recursively, and clips from
-    every session end up under the same label.
+    Sessions live in their own subdirectories, and their clips accumulate under one label.
     """
     import isolate_keystrokes as ik
 

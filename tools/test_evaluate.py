@@ -1,17 +1,11 @@
-"""Tiny synthetic-data test for evaluate.py (File 5).
+"""Synthetic-data tests for evaluate.py.
 
-Proves the evaluation path works end-to-end before we trust it on real clips:
-  * the pure-numpy metrics (confusion matrix, per-class P/R/F1, macro-F1 over
-    PRESENT classes) match hand-computed values on a tiny known example,
-  * macro-F1 ignores absent classes rather than being dragged toward 0,
-  * save_confusion_png writes a byte-valid PNG (correct signature + IHDR dims)
-    with no matplotlib installed,
-  * the adjacent-key clustering check scores physically-near confusions as
-    adjacent and reports a sensible chance baseline,
-  * a full train->evaluate round-trip on separable synthetic data reproduces
-    the checkpoint's own val accuracy on the SAME stored split,
-  * THE CRITICAL GUARD: if the dataset is mutated after training, evaluate()
-    REFUSES (raises) instead of silently reporting a fake accuracy.
+Covers the pure-numpy metrics (confusion matrix, per-class precision/recall/F1,
+macro-F1 over present classes), PNG confusion-matrix output with no matplotlib
+installed, the adjacent-key clustering check, a full train-then-evaluate round
+trip that reproduces the checkpoint's stored validation accuracy, and the
+guard that refuses to evaluate a dataset that does not match the checkpoint's
+training data.
 
 Run:  python test_evaluate.py
 """
@@ -40,6 +34,7 @@ from test_train import make_separable_dataset
 
 
 def test_metrics_match_hand_computed():
+    """Verifies confusion_matrix, per_class_prf, and macro_f1_present against a hand-computed example."""
     # 3 classes, 6 samples. Confusion we construct by hand:
     #   true=[0,0,1,1,2,2], pred=[0,1,1,1,2,0]
     y_true = np.array([0, 0, 1, 1, 2, 2], dtype=np.int64)
@@ -64,6 +59,7 @@ def test_metrics_match_hand_computed():
 
 
 def test_macro_f1_ignores_absent_classes():
+    """Verifies macro_f1_present excludes classes with no support instead of dragging the average down."""
     # 4-class label space but only classes 0 and 1 appear in the held-out set.
     y_true = np.array([0, 0, 1, 1], dtype=np.int64)
     y_pred = np.array([0, 0, 1, 1], dtype=np.int64)   # perfect
@@ -76,6 +72,7 @@ def test_macro_f1_ignores_absent_classes():
 
 
 def test_confusion_png_is_valid():
+    """Verifies save_confusion_png writes a byte-valid PNG without matplotlib installed."""
     cm = np.array([[5, 1, 0], [0, 4, 2], [1, 0, 6]], dtype=np.int64)
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "cm.png")
@@ -94,6 +91,7 @@ def test_confusion_png_is_valid():
 
 
 def test_adjacency_scores_near_keys():
+    """Verifies adjacency_analysis scores physically near-key confusions as adjacent."""
     labels = [str(d) for d in range(10)] + [chr(c) for c in range(ord("a"), ord("z") + 1)] + ["space"]
     idx = {lab: i for i, lab in enumerate(labels)}
     # 'a' mistaken as 's' (right neighbour) and 'q' as 'w' (right neighbour):
@@ -104,7 +102,7 @@ def test_adjacency_scores_near_keys():
     assert a["n_errors"] == 3 and a["n_scored"] == 3
     assert a["n_adjacent"] == 2, a
     assert np.isclose(a["frac_adjacent"], 2 / 3)
-    # Baseline is computed over only the PRESENT keys (5 top-left keys here, so
+    # Baseline is computed over only the present keys (5 top-left keys here, so
     # it's high); on a real 37-key eval it is far below frac_adjacent.
     assert 0.0 < a["baseline"] < 1.0, f"chance baseline looks wrong: {a['baseline']}"
     print(f"adjacency: near-key confusions scored adjacent (2/3), "
@@ -112,6 +110,12 @@ def test_adjacency_scores_near_keys():
 
 
 def test_roundtrip_reproduces_stored_val_acc_and_guard():
+    """Verifies a train-then-evaluate round trip reproduces the stored accuracy.
+
+    Also confirms evaluate() refuses to run once the dataset no longer
+    matches the checkpoint's training data, whether from mutated content or
+    reordered rows.
+    """
     import torch
     X, Y, labels = make_separable_dataset(3)
     with tempfile.TemporaryDirectory() as tmp:
@@ -119,7 +123,7 @@ def test_roundtrip_reproduces_stored_val_acc_and_guard():
         ckpt_path = os.path.join(tmp, "checkpoint.pt")
         cm_path = os.path.join(tmp, "confusion.png")
 
-        # Save the dataset EXACTLY as train/evaluate load it, then train on it.
+        # Save the dataset exactly as train/evaluate load it, then train on it.
         np.savez(data_path, X=X, Y=Y, labels=np.array(labels))
         best_acc, _ = T.train_model(
             X, Y, labels, kind="cnn", epochs=40, batch_size=16, lr=5e-4,
@@ -127,8 +131,9 @@ def test_roundtrip_reproduces_stored_val_acc_and_guard():
         )
 
         res = E.evaluate(data_path, ckpt_path, cm_path=cm_path, verbose=False)
-        # Re-evaluating the best checkpoint on the SAME stored split reproduces
-        # its recorded accuracy (best checkpoint == final here for separable data).
+        # Re-evaluating the best checkpoint on the same stored split reproduces
+        # its recorded accuracy (best checkpoint equals final here, since the
+        # data is separable).
         assert np.isclose(res["accuracy"], best_acc, atol=1e-6), \
             f"eval acc {res['accuracy']} != stored best {best_acc}"
         assert res["cm_path"] == cm_path and os.path.isfile(cm_path)
@@ -136,23 +141,23 @@ def test_roundtrip_reproduces_stored_val_acc_and_guard():
         print(f"round-trip: eval reproduced stored val_acc={res['accuracy']:.3f} "
               f"on the same split OK")
 
-        # ---- THE GUARD, case 1: mutate a pixel, evaluate must REFUSE ----
+        # Guard, case 1: mutate a pixel; evaluate must refuse.
         Xbad = X.copy()
-        Xbad[0, 0, 0] += 0.5           # one pixel -> different hash
+        Xbad[0, 0, 0] += 0.5           # one pixel changes the dataset hash
         np.savez(data_path, X=Xbad, Y=Y, labels=np.array(labels))
         try:
             E.evaluate(data_path, ckpt_path, cm_path=None, verbose=False)
         except RuntimeError as e:
             assert "hash" in str(e).lower()
-            print("guard: mutated dataset -> evaluate() REFUSED (hash mismatch) OK")
+            print("guard: mutated dataset -> evaluate() refused (hash mismatch) OK")
         else:
-            raise AssertionError("evaluate() did NOT refuse a mutated dataset -- fake-accuracy guard broken")
+            raise AssertionError("evaluate() did not refuse a mutated dataset -- fake-accuracy guard broken")
 
-        # ---- THE GUARD, case 2: SAME content, rows REORDERED, must REFUSE ----
-        # This is the guard's real purpose: a rebuilt pool with identical images
-        # but a different row order silently invalidates the stored val_index.
-        # The bytes differ, so the hash differs, so evaluate must refuse -- even
-        # though every image and label is still present.
+        # Guard, case 2: same content, rows reordered; evaluate must refuse.
+        # A rebuilt pool with identical images but a different row order
+        # silently invalidates the stored val_index even though every image
+        # and label is still present, so the bytes -- and hence the hash --
+        # differ and evaluate must refuse.
         perm = np.random.default_rng(7).permutation(len(Y))
         assert not np.array_equal(perm, np.arange(len(Y))), "permutation was identity"
         np.savez(data_path, X=X[perm], Y=Y[perm], labels=np.array(labels))
@@ -160,27 +165,25 @@ def test_roundtrip_reproduces_stored_val_acc_and_guard():
             E.evaluate(data_path, ckpt_path, cm_path=None, verbose=False)
         except RuntimeError as e:
             assert "hash" in str(e).lower()
-            print("guard: reordered-but-same-content dataset -> evaluate() REFUSED OK")
+            print("guard: reordered-but-same-content dataset -> evaluate() refused OK")
         else:
-            raise AssertionError("evaluate() did NOT refuse a reordered dataset -- val_index would mis-index")
+            raise AssertionError("evaluate() did not refuse a reordered dataset -- val_index would misindex")
 
 
 def test_refused_banner_means_only_the_hash_guard():
-    """`REFUSED:` + exit 1 must mean one thing: this dataset is not the one the
-    checkpoint was trained on.
+    """Verifies the `REFUSED:` banner is reserved for the hash-contract guard.
 
-    Every other RuntimeError the CLI can hit -- a bad device ordinal, an OOM, a
-    corrupt checkpoint -- has to report as a plain error, or the user goes off
-    rebuilding a pool that was never the problem.
+    Other RuntimeErrors -- a bad device ordinal, an OOM, a corrupt checkpoint
+    -- must report as plain errors, not under the REFUSED banner.
     """
     import subprocess
     import sys as _sys
 
-    # The guard's own errors are the dedicated type ...
+    # The guard's own errors use the dedicated type ...
     assert issubclass(E.DatasetContractError, RuntimeError), \
         "DatasetContractError must subclass RuntimeError (existing callers rely on it)"
 
-    # ... and a device failure must NOT come back under the REFUSED banner.
+    # ... and a device failure must not come back under the REFUSED banner.
     # A nonexistent ordinal is the cheapest way to force a non-guard failure.
     r = subprocess.run(
         [_sys.executable, "evaluate.py", "--data", "nonexistent_pool.npz",

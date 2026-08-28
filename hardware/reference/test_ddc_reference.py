@@ -1,23 +1,7 @@
 """Tests for the DDC reference model.
 
-This model is the reference the DDC RTL gets checked against, so it is the one
-piece of the hardware flow that has nothing above it to catch its mistakes. A
-wrong reference model does not fail -- it certifies a broken chip. These tests are
-therefore aimed at the errors that would still LOOK right:
-
-  * a mirrored spectrum (conjugate backwards) -- the magnitude spectrogram is
-    unchanged, so every downstream plot looks fine,
-  * K applied instead of 1/K -- a 4.3 dB level shift that reads as "gain",
-  * the CORDIC silently failing to converge near pi/2,
-  * truncation that rounds toward zero instead of toward -inf, which matches
-    C but not Verilog's >>>,
-  * the two mixer architectures quietly computing different functions, which
-    would make the whole synthesis comparison meaningless.
-
-Several tests deliberately construct the BUG and assert the check catches it
-(`_mix_mirrored`, `test_..._would_be_caught`). A test that cannot fail is not
-evidence, and sign-convention tests are unusually prone to being written in a
-way that passes either way.
+Several tests construct a known failure case directly and confirm the
+corresponding check flags it, since a test that cannot fail is not evidence.
 
 Run:  python hardware/reference/test_ddc_reference.py
 """
@@ -51,7 +35,16 @@ from ddc_reference import DDCConfig, DDC, MIX_SEPARATE, MIX_FUSED, TRUNC, ROUND
 
 
 def _peak_bin_hz(y, fs):
-    """Frequency of the largest FFT bin, signed (negative for the lower half)."""
+    """Find the frequency of the largest FFT bin, signed.
+
+    Args:
+        y: Complex signal.
+        fs: Sample rate in Hz.
+
+    Returns:
+        The peak bin's frequency in Hz, negative for the lower half of the
+        spectrum.
+    """
     spec = np.abs(np.fft.fft(y * np.hanning(len(y))))
     k = int(np.argmax(spec))
     if k > len(y) // 2:
@@ -60,24 +53,19 @@ def _peak_bin_hz(y, fs):
 
 
 def _mix_mirrored(ddc, xi, xq, cos, sin):
-    """The QUIET sign bug: correct mix, then Q negated.
+    """Mix with Q negated, producing a mirrored spectrum instead of a correct mix.
 
-    Worth being precise about, because the two plausible sign errors have very
-    different signatures and only one of them is dangerous:
+    Same amplitude and bandwidth as a correct mix, but mirrored about DC.
+    Implements the failure test_sign_convention_is_not_mirrored must detect.
 
-      * multiply by the NCO instead of its conjugate -> the tone moves to
-        2*f_lo + delta and the lowpass deletes it. The output is empty. Nobody
-        ships this; it fails on the first plot.
+    Args:
+        ddc: The DDC model providing the config and shift/saturation
+            behavior.
+        xi, xq: Input I/Q samples.
+        cos, sin: NCO output.
 
-      * negate Q (a flipped subtraction in the Q equation) -> the output is
-        conj(x * exp(-j*theta)), so the spectrum is MIRRORED about DC. Full
-        amplitude, correct bandwidth, plausible-looking magnitude spectrogram,
-        and every feature sitting on the wrong side of the carrier. This one
-        ships.
-
-    So this helper implements the second, and `test_sign_convention_is_not_
-    mirrored` has to be able to catch it. The first case is covered separately
-    by `test_wrong_rotation_direction_in_fused_would_upconvert`.
+    Returns:
+        The mirrored (i, q) mix result.
     """
     c = ddc.cfg
     pi_ = np.asarray(xi, np.int64) * cos + np.asarray(xq, np.int64) * sin
@@ -109,14 +97,14 @@ def test_convergence_limit_covers_the_quadrant_residual():
     assert lim > math.pi / 2, "range reduction to [0, pi/2) would not converge"
     # The margin is only ~0.17 rad; if someone shortens the CORDIC it vanishes.
     assert G.cordic_convergence_limit(2) < math.pi / 2, (
-        "a 2-iteration CORDIC should NOT cover pi/2 -- if it does, the limit "
+        "a 2-iteration CORDIC should not cover pi/2 -- if it does, the limit "
         "calculation is wrong and the guard in DDCConfig is vacuous"
     )
     print(f"convergence limit: {lim:.6f} rad > pi/2 OK")
 
 
 def test_cordic_reproduces_sin_cos_across_the_full_circle():
-    """Sweep every quadrant, not just the first -- the fixups are per-quadrant."""
+    """Sweeps every quadrant, since the fixups are per-quadrant."""
     cfg = DDCConfig()
     ddc = DDC(cfg)
     n = 4096
@@ -142,10 +130,10 @@ def test_cordic_converges_at_the_range_reduction_boundary():
     z0 = np.array([0, 1, quarter // 2, quarter - 2, quarter - 1], np.int64)
     x0 = np.full(z0.shape, int(round(G.full_scale(cfg.cordic_bits) / cfg.k_gain)), np.int64)
     x, y, z = G.cordic_rotate(x0, np.zeros_like(z0), z0, tbl, cfg.cordic_bits)
-    # The residual cannot go below the LAST rotation step -- that is the finest
-    # correction the CORDIC has left. Asserting a tighter bound than the
-    # algorithm can reach would just be a test tuned to today's numbers, so the
-    # criterion is the step size itself.
+    # The residual cannot go below the last rotation step -- that is the
+    # finest correction the CORDIC has left. Asserting a tighter bound than
+    # the algorithm can reach would just be a test tuned to today's numbers,
+    # so the criterion is the step size itself.
     last_step = int(tbl[-1])
     assert np.abs(z).max() <= last_step, (
         f"residual angle {np.abs(z).max()} LSB exceeds the final rotation step "
@@ -159,11 +147,7 @@ def test_cordic_converges_at_the_range_reduction_boundary():
 
 
 def test_nco_amplitude_is_unit_because_of_the_inv_k_seed():
-    """Drop the 1/K seed and the amplitude should come out K, not 1.
-
-    This is the K-scaling test with teeth: it asserts the correct value AND that
-    the wrong seed produces a detectably different one.
-    """
+    """Confirms the seeded NCO is unit amplitude, and an unseeded one measures K."""
     cfg = DDCConfig()
     ddc = DDC(cfg)
     phase = np.linspace(0, (1 << cfg.phase_bits) - 1, 512).astype(np.int64)
@@ -172,10 +156,11 @@ def test_nco_amplitude_is_unit_because_of_the_inv_k_seed():
     assert abs(mag.mean() - 1.0) < 2e-3, f"seeded NCO amplitude {mag.mean()}"
 
     # Unseeded, i.e. x0 not divided by K: amplitude comes out K instead of 1.
-    # Seeded at HALF scale deliberately -- at full scale the K growth saturates
-    # the CORDIC word and the measurement would read the clip level (~1.11)
-    # rather than K. That saturation is real, and is exactly why the fused mixer
-    # needs its extra bit; here it just has to be kept out of the way.
+    # Seeded at half scale deliberately -- at full scale the K growth
+    # saturates the CORDIC word and the measurement would read the clip
+    # level (~1.11) rather than K. That saturation is real, and is why the
+    # fused mixer needs its extra bit; here it just has to be kept out of
+    # the way.
     tbl = ddc.atan
     q, rem = G.quadrant_split(ddc.angle_word(phase), cfg.ang_bits)
     half = G.full_scale(cfg.cordic_bits) // 2
@@ -206,13 +191,13 @@ def test_atan_table_exhaustion_is_rejected():
 
 
 def test_trunc_shift_matches_verilog_not_c():
-    """Verilog's >>> floors; C's / truncates toward zero. They differ on negatives."""
+    """Verilog's >>> floors. C's / truncates toward zero instead."""
     x = np.array([-9, -1, 1, 9], np.int64)
     got = G.shr(x, 1, TRUNC)
     assert got.tolist() == [-5, -1, 0, 4], got.tolist()
     assert (x // 2).tolist() == got.tolist(), "should match floor division"
     assert (x.astype(float) / 2).astype(np.int64).tolist() != got.tolist(), (
-        "should NOT match round-toward-zero -- that would be the C semantics"
+        "should not match round-toward-zero -- that would be the C semantics"
     )
     rnd = G.shr(x, 1, ROUND)
     assert rnd.tolist() == [-4, 0, 1, 5], rnd.tolist()
@@ -245,10 +230,8 @@ def test_int64_overflow_is_caught_not_silent():
 def test_sign_convention_is_not_mirrored():
     """A tone at f_lo + delta must land at +delta, not -delta.
 
-    If the mixer multiplies by the NCO instead of its conjugate, the output
-    spectrum is mirrored. Magnitude spectrograms are unaffected, so nothing
-    downstream complains -- this test is the only thing standing between that
-    bug and silicon.
+    A mirrored spectrum has the same magnitude, so nothing downstream would
+    otherwise catch it.
     """
     cfg = DDCConfig()
     ddc = DDC(cfg)
@@ -269,11 +252,11 @@ def test_sign_convention_is_not_mirrored():
     print(f"sign convention: +/-{delta / 1e3:.0f} kHz land on the correct sides OK")
 
 
-def test_a_mirrored_mixer_would_be_caught():
-    """Prove the check above discriminates, by feeding it the actual bug.
+def test_mirrored_mixer_is_detected():
+    """Confirms the sign-convention check flags a deliberately mirrored mixer.
 
-    The mirrored output must have the SAME amplitude as the correct one -- that
-    is what makes the bug survive review -- and land on the opposite side.
+    The mirrored output must match the correct one in amplitude and land on
+    the opposite side of the carrier.
     """
     cfg = DDCConfig()
     ddc = DDC(cfg)
@@ -294,16 +277,17 @@ def test_a_mirrored_mixer_would_be_caught():
         f"the deliberately-mirrored mixer landed at {got:+.0f} Hz; expected "
         f"{-delta:+.0f} Hz. The sign test cannot discriminate."
     )
-    # Same amplitude as the correct path: the bug is invisible in magnitude.
+    # Same amplitude as the correct path.
     good = (ddc.run(xi, xq)["out_i"] + 1j * ddc.run(xi, xq)["out_q"])[skip:]
     ratio = np.abs(bad).mean() / np.abs(good).mean()
     assert 0.98 < ratio < 1.02, (
         f"mirrored output amplitude ratio {ratio:.3f} -- if it differed this "
-        f"much the bug would be obvious, and the test would be too easy"
+        f"much, magnitude alone would already reveal the mirroring, and the "
+        f"test would be too easy"
     )
     print(
         f"mirrored mixer lands at {got / 1e3:+.1f} kHz at {ratio:.3f}x amplitude "
-        f"-- silent bug, test discriminates OK"
+        f"-- same magnitude, opposite side, test discriminates OK"
     )
 
 
@@ -331,7 +315,7 @@ def test_dc_lands_at_dc():
 
 
 def test_k_folding_lands_both_architectures_on_the_same_scale():
-    """Separate removes K at the seed, fused in the coefficients -- same output."""
+    """Separate removes K at the seed. Fused removes it in the coefficients."""
     sep = DDC(DDCConfig(mix_arch=MIX_SEPARATE))
     fus = DDC(DDCConfig(mix_arch=MIX_FUSED))
     assert not sep.fold_inv_k and fus.fold_inv_k
@@ -340,15 +324,15 @@ def test_k_folding_lands_both_architectures_on_the_same_scale():
     dc_fus = fus.coef.sum() / G.full_scale(fus.cfg.coef_bits)
     assert abs(dc_sep - 1.0) < 1e-4, f"separate FIR DC gain {dc_sep}"
     assert abs(dc_fus - 1.0 / fus.cfg.k_gain) < 1e-4, f"fused FIR DC gain {dc_fus}"
-    # The ratio IS K -- this is the assertion that catches K vs 1/K inverted.
+    # The ratio equals K -- this is the assertion that catches K vs 1/K inverted.
     assert abs(dc_sep / dc_fus - fus.cfg.k_gain) < 1e-3, (
         f"coefficient ratio {dc_sep / dc_fus} should equal K={fus.cfg.k_gain}"
     )
     print(f"K folding: DC gains {dc_sep:.4f} / {dc_fus:.4f}, ratio = K OK")
 
 
-def test_k_folded_the_wrong_way_would_be_4_3_db_hot():
-    """Confirm the magnitude of the bug the previous test guards against."""
+def test_k_folded_the_wrong_way_is_4_3_db_hot():
+    """Measure the level error from folding K instead of 1/K into the FIR."""
     cfg = DDCConfig(mix_arch=MIX_FUSED)
     h = G.firwin_lowpass(cfg.n_taps, cfg.fir_cutoff / (cfg.fs_in / 2))
     right = G.fir_taps_quantized(h, cfg.coef_bits, True, cfg.k_gain)
@@ -359,7 +343,7 @@ def test_k_folded_the_wrong_way_would_be_4_3_db_hot():
 
 
 def test_fused_mixer_carries_one_extra_bit():
-    """The fused K growth needs headroom; that cost must be visible in the config."""
+    """The fused K growth needs headroom, and that cost must show in the config."""
     assert DDCConfig(mix_arch=MIX_SEPARATE).mix_bits == 16
     assert DDCConfig(mix_arch=MIX_FUSED).mix_bits == 17
     # And a fused config with no CORDIC guard bits is rejected outright.
@@ -378,12 +362,10 @@ def test_fused_mixer_carries_one_extra_bit():
 
 
 def test_separate_and_fused_agree():
-    """The synthesis comparison is meaningless unless both do the same thing.
+    """The synthesis comparison is meaningless unless both compute the same answer.
 
-    Not bit-exact -- they quantize in different places -- but they must agree to
-    well within a quantization step of each other, and both must track the ideal
-    model closely. A structural error in either (wrong quadrant fixup, wrong
-    rotation direction) blows this up immediately.
+    Not bit-exact, since they quantize differently. Both must track the ideal
+    model closely and agree with each other.
     """
     n = 8192
     cs = DDCConfig(mix_arch=MIX_SEPARATE)
@@ -407,20 +389,11 @@ def test_separate_and_fused_agree():
 
 
 def test_wrong_rotation_direction_in_fused_is_caught():
-    """Seeding z0=+rem instead of -rem must be detectable.
+    """Confirms a reversed CORDIC rotation direction is caught by SNR, not power.
 
-    The obvious guess -- "it up-converts, so the lowpass deletes it" -- is
-    WRONG, and worth writing down because believing it would leave this test
-    toothless. The quadrant pre-rotation is still applied in the correct
-    (negative) direction; only the residual is inverted. So the output is the
-    correctly down-converted signal multiplied by exp(+j*2*rem), and rem is a
-    sawtooth ramp across each quadrant. That is phase distortion, not
-    translation: the energy stays in band and the amplitude only drops ~30%,
-    which no power check would flag.
-
-    What collapses is fidelity. The correct path tracks the ideal model at
-    ~79 dB; the sawtooth phase error drops that to single digits. SNR against
-    the ideal model is the discriminator here, not signal power.
+    Reversing the rotation direction distorts phase rather than shifting
+    frequency, so amplitude drops only slightly. SNR against the ideal model
+    collapses from ~79 dB to single digits, which is what this test checks.
     """
     cfg = DDCConfig(mix_arch=MIX_FUSED)
     ddc = DDC(cfg)
@@ -432,7 +405,7 @@ def test_wrong_rotation_direction_in_fused_is_caught():
     q, rem = G.quadrant_split(ddc.angle_word(ph), cfg.ang_bits)
     ri, rq = G.prerotate_conj(q, xi, xq)
     g = cfg.cordic_bits - cfg.data_bits - 1
-    # +rem: the bug.
+    # Seed with +rem instead of -rem to reverse the rotation direction.
     x, y, _ = G.cordic_rotate(
         ri << np.int64(g), rq << np.int64(g), rem, ddc.atan, cfg.cordic_bits, cfg.shift_mode
     )
@@ -454,7 +427,7 @@ def test_wrong_rotation_direction_in_fused_is_caught():
         f"the inverted rotation scored {snr_bad:.1f} dB against the ideal model; "
         f"if a sign error can score that well the SNR check is not discriminating"
     )
-    # And confirm the trap: power alone does NOT separate them.
+    # And confirm the trap: power alone does not separate them.
     ratio = np.abs(good).mean() / np.abs(bad).mean()
     assert ratio < 2.0, (
         f"amplitude ratio {ratio:.2f} -- if power alone separated these, the "
@@ -485,14 +458,14 @@ def test_fir_has_unit_dc_gain_and_linear_phase():
 
 
 def test_fir_rejects_out_of_band():
-    """A tone past the cutoff must be attenuated, or decimation aliases it in."""
+    """A tone past the cutoff must be attenuated, or decimation aliases it back in."""
     cfg = DDCConfig()
     ddc = DDC(cfg)
     n = 8192
     skip = 0  # fir_decimate is valid-only: no fill transient to trim
 
     in_band = G.tone(n, cfg.fs_in, cfg.f_lo_actual + 20_000.0, -6.0, cfg.data_bits)
-    # Past the cutoff AND past the decimated Nyquist, so it would fold back.
+    # Past the cutoff and past the decimated Nyquist, so it would fold back.
     out_band = G.tone(n, cfg.fs_in, cfg.f_lo_actual + 200_000.0, -6.0, cfg.data_bits)
 
     a = ddc.run(*in_band)
@@ -505,10 +478,10 @@ def test_fir_rejects_out_of_band():
 
 
 def test_decimation_takes_the_right_phase():
-    """Off-by-one in the decimation offset is a delay, and delays hide.
+    """An off-by-one decimation offset just looks like a delay, which hides easily.
 
-    Checked against an independently computed convolution rather than against
-    the model's own path.
+    Checked against an independently computed convolution, not the model's
+    own path.
     """
     cfg = DDCConfig(decim=4, n_taps=15)
     coef = np.arange(1, 16, dtype=np.int64)
@@ -552,7 +525,7 @@ def test_fixed_point_tracks_the_ideal_model():
 
 
 def test_narrower_datapath_is_measurably_worse():
-    """Sanity: the SNR metric must respond to width, or it is measuring nothing."""
+    """Confirms the SNR metric responds to datapath width."""
     wide = G.report(DDCConfig(), n=4096)["ddc_snr_db"]
     narrow = G.report(DDCConfig(data_bits=10, cordic_bits=14, out_bits=10), n=4096)[
         "ddc_snr_db"
@@ -566,8 +539,7 @@ def test_narrower_datapath_is_measurably_worse():
 
 def test_lo_quantization_is_reported_honestly():
     """A frequency the accumulator cannot hit must be reported, not rounded away."""
-    # A 12-bit accumulator, with the angle path narrowed to match and the CORDIC
-    # shortened to what a 12-bit angle table can actually resolve.
+    # A 12-bit accumulator, with the angle path and CORDIC narrowed to match.
     cfg = DDCConfig(
         phase_bits=12, phase_trunc_bits=12, ang_bits=12, n_iter=9, f_lo=300_123.0
     )
@@ -590,7 +562,7 @@ def test_lo_quantization_is_reported_honestly():
 
 
 def test_m_and_n_are_independent_knobs():
-    """M sets frequency resolution, N sets spectral purity. Not the same number."""
+    """M sets frequency resolution. N sets spectral purity, a separate concern."""
     c = DDCConfig()
     assert c.phase_bits == 32 and c.phase_trunc_bits == 14
 
@@ -618,11 +590,10 @@ def test_m_and_n_are_independent_knobs():
 
 
 def test_phase_truncation_only_bites_when_the_fcw_exercises_it():
-    """The binary-fraction trap, asserted rather than trusted.
+    """Confirms phase truncation only costs SFDR when the FCW has nonzero low bits.
 
-    The default LO discards only zero bits, so N costs nothing there. An LO that
-    discards nonzero bits pays the ~6.02*N spur penalty. If these two ever
-    measure the same, the truncation is not being modelled.
+    The default LO discards only zero bits, so truncation costs nothing
+    there. An LO with nonzero low bits pays the ~6.02*N spur penalty.
     """
     cfg = DDCConfig()
     ddc = DDC(cfg)
@@ -656,7 +627,7 @@ def test_phase_truncation_only_bites_when_the_fcw_exercises_it():
 
 
 def test_widening_n_improves_spectral_purity():
-    """N is the knob that moves NCO purity -- confirm it actually does."""
+    """Confirms N is the knob that controls NCO spectral purity."""
     n = 8192
     got = {}
     for N in (10, 14, 18):
@@ -674,7 +645,7 @@ def test_widening_n_improves_spectral_purity():
 
 
 def test_angle_word_zero_pads_rather_than_requantising():
-    """N-bit truncation then zero-pad: the low ang_bits-N bits must be zero."""
+    """After truncating to N bits, the low ang_bits-N padding bits must be zero."""
     cfg = DDCConfig()
     ddc = DDC(cfg)
     pad = cfg.ang_bits - cfg.phase_trunc_bits
@@ -754,11 +725,11 @@ def main():
     test_int64_overflow_is_caught_not_silent()
 
     test_sign_convention_is_not_mirrored()
-    test_a_mirrored_mixer_would_be_caught()
+    test_mirrored_mixer_is_detected()
     test_dc_lands_at_dc()
 
     test_k_folding_lands_both_architectures_on_the_same_scale()
-    test_k_folded_the_wrong_way_would_be_4_3_db_hot()
+    test_k_folded_the_wrong_way_is_4_3_db_hot()
     test_fused_mixer_carries_one_extra_bit()
 
     test_separate_and_fused_agree()

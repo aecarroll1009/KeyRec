@@ -1,14 +1,7 @@
-"""Tiny synthetic-data test for train.py.
+"""Synthetic-data tests for train.py.
 
-Proves the core path works before we move on to File 5 (evaluate.py):
-  * dataset_hash is deterministic and changes when X or Y changes (this is the
-    contract evaluate.py relies on to reject a stale val_index),
-  * stratified_split puts every class in BOTH train and val, with no overlap,
-  * augment_batch preserves shape, actually changes the data, and its time-shift
-    is zero-filled (a contiguous zero edge, not a circular wrap),
-  * a short training run on separable synthetic data LEARNS (val accuracy well
-    above chance) and saves a checkpoint containing all required keys,
-  * the saved checkpoint's data_hash matches the dataset it was trained on.
+Covers hashing, splitting, augmentation, device resolution, determinism, and
+a short training run that saves a checkpoint.
 
 Run:  python test_train.py
 """
@@ -37,10 +30,18 @@ PER_CLASS = 12
 
 
 def make_separable_dataset(seed=0):
-    """Each class gets a bright horizontal band in a distinct frequency region,
-    on a low-noise floor. Bands are on the FREQUENCY axis, so the time-shift
-    augmentation (which moves columns) leaves the class cue intact -- the model
-    should learn this quickly."""
+    """Build a synthetic dataset where each class occupies a distinct frequency band.
+
+    The bands sit on the frequency axis. Time-shift augmentation only moves
+    columns and leaves them intact.
+
+    Args:
+        seed: Seed for the dataset's random generator.
+
+    Returns:
+        An (X, Y, labels) tuple: images of shape (N, 64, 64), integer class
+        labels, and the class name for each label index.
+    """
     rng = np.random.default_rng(seed)
     imgs, ys = [], []
     band_h = 64 // N_CLASSES
@@ -57,7 +58,21 @@ def make_separable_dataset(seed=0):
     return X, Y, labels
 
 
+def _flatten_state_dict(ckpt):
+    """Flatten a checkpoint's state_dict into one 1-D tensor for weight comparison.
+
+    Args:
+        ckpt: A checkpoint dict as returned by train_model, containing state_dict.
+
+    Returns:
+        A 1-D torch tensor concatenating every parameter tensor's values.
+    """
+    import torch
+    return torch.cat([v.flatten() for v in ckpt["state_dict"].values()])
+
+
 def test_dataset_hash():
+    """Verify dataset_hash is deterministic and changes whenever X or Y changes."""
     X, Y, _ = make_separable_dataset(0)
     h1 = T.dataset_hash(X, Y)
     h2 = T.dataset_hash(X.copy(), Y.copy())
@@ -71,6 +86,7 @@ def test_dataset_hash():
 
 
 def test_stratified_split_covers_all_classes():
+    """Verify stratified_split puts every class in both train and val with no overlap."""
     X, Y, _ = make_separable_dataset(1)
     tr, va = T.stratified_split(Y, val_frac=0.25, seed=1)
     assert len(set(tr) & set(va)) == 0, "train/val overlap"
@@ -82,6 +98,7 @@ def test_stratified_split_covers_all_classes():
 
 
 def test_augment_batch_shape_and_zero_fill():
+    """Verify augment_batch preserves shape, changes the data, and zero-fills its time-shift."""
     X, Y, _ = make_separable_dataset(2)
     rng = np.random.default_rng(0)
     batch = X[:4].copy()
@@ -90,7 +107,7 @@ def test_augment_batch_shape_and_zero_fill():
     assert out.dtype == np.float32
     assert np.any(out != batch), "augment_batch changed nothing"
 
-    # Directly exercise the spectrogram time-shift and confirm a zero-filled
+    # Exercise the spectrogram time-shift directly and confirm a zero-filled
     # contiguous edge (not a circular wrap) for a forced nonzero shift.
     img = np.ones((64, 64), dtype=np.float32)
     for _ in range(50):
@@ -106,9 +123,10 @@ def test_augment_batch_shape_and_zero_fill():
 
 
 def test_augment_batch_torch_matches_numpy_semantics():
-    """The on-device augmentation is a separate implementation, so it needs the
-    same guarantees proven separately -- especially zero-fill-not-circular,
-    which is bug #6 from the spec. Runs on CPU tensors so it tests everywhere."""
+    """Verify the torch augmentation matches the numpy path's shape, zero-fill, and mask-fill behavior.
+
+    Runs on CPU tensors.
+    """
     import torch
 
     X, _, _ = make_separable_dataset(4)
@@ -128,7 +146,7 @@ def test_augment_batch_torch_matches_numpy_semantics():
     for i in range(shifted.shape[0]):
         zero_cols = torch.nonzero(torch.all(shifted[i] == 0.0, dim=0)).flatten()
         if len(zero_cols) == 0:
-            continue                      # this image drew shift == 0
+            continue  # this image drew shift == 0
         found += 1
         k = len(zero_cols)
         at_start = torch.equal(zero_cols, torch.arange(k))
@@ -137,12 +155,12 @@ def test_augment_batch_torch_matches_numpy_semantics():
         assert k <= int(round(0.4 * 64)), "torch time-shift exceeded max_frac"
     assert found > 0, "no image in the batch drew a nonzero shift"
 
-    # Mask fill value. Pinned with max_frac=0.0 so there is no shift: the mean
-    # is then exactly the input's own mean, and every cell the augmentation
-    # touched must equal it. An all-ones probe would pass for any fill <= 1
-    # (including 0.0, or the wrong image's mean), so use varied per-image data.
+    # Mask fill value: pinned with max_frac=0.0 so there is no shift, so the
+    # mean is exactly the input's own mean and every masked cell must equal
+    # it. An all-ones probe would pass for any fill <= 1 (including 0.0, or
+    # the wrong image's mean), so use varied per-image data instead.
     probe = torch.rand((6, 64, 64), generator=gen, dtype=torch.float32)
-    probe[1] *= 0.2                       # give the images clearly different means
+    probe[1] *= 0.2  # give the images clearly different means
     probe[2] = probe[2] * 0.5 + 0.5
     filled = T.augment_batch_torch(probe, gen, max_frac=0.0)
     changed = filled != probe
@@ -155,9 +173,10 @@ def test_augment_batch_torch_matches_numpy_semantics():
 
 
 def test_resolve_device_never_falls_back_silently():
-    """auto may resolve to cpu, but an EXPLICIT cuda request on a box without
-    working CUDA must raise -- silently training on the CPU for 1100 epochs is
-    the failure this guard exists to prevent."""
+    """Verify resolve_device never silently substitutes a different device than what was requested.
+
+    An explicit cuda request must raise if CUDA is unavailable, not fall back to cpu.
+    """
     import torch
 
     assert T.resolve_device("cpu", verbose=False) == "cpu"
@@ -179,8 +198,8 @@ def test_resolve_device_never_falls_back_silently():
     if cuda_ready:
         assert T.resolve_device("cuda", verbose=False) == "cuda"
         assert T.resolve_device("cuda:0", verbose=False) == "cuda:0"
-        # An out-of-range ordinal must be caught here. Left to torch it
-        # surfaces later, from whatever first touches the device.
+        # An out-of-range ordinal must be caught here, rather than surfacing
+        # later from whatever first touches the device.
         n_gpu = torch.cuda.device_count()
         try:
             T.resolve_device(f"cuda:{n_gpu + 5}", verbose=False)
@@ -200,11 +219,9 @@ def test_resolve_device_never_falls_back_silently():
 
 
 def test_same_seed_reproduces_on_cpu():
-    """--seed must pin the WHOLE run, not just the split and the augmentation.
+    """Verify --seed pins the entire run, including weight init and dropout.
 
-    Without torch.manual_seed the weight init and dropout masks come from
-    torch's unseeded global RNG, so two runs at the same seed can land on very
-    different accuracies -- and no quoted number is reproducible.
+    Not just the split and augmentation.
     """
     import torch
 
@@ -213,26 +230,24 @@ def test_same_seed_reproduces_on_cpu():
     for _ in range(2):
         acc, ckpt = T.train_model(X, Y, labels, kind="cnn", epochs=6, batch_size=16,
                                   seed=1234, device="cpu", out_path=None, verbose=False)
-        flat = torch.cat([v.flatten() for v in ckpt["state_dict"].values()])
-        runs.append((acc, flat))
+        runs.append((acc, _flatten_state_dict(ckpt)))
 
     assert runs[0][0] == runs[1][0], (
         f"same seed gave different val_acc: {runs[0][0]} vs {runs[1][0]}")
     assert torch.equal(runs[0][1], runs[1][1]), "same seed gave different weights"
 
-    # And a different seed must actually change something, or the above is vacuous.
+    # A different seed must actually change something, or the check above is vacuous.
     _, other = T.train_model(X, Y, labels, kind="cnn", epochs=6, batch_size=16,
                              seed=99, device="cpu", out_path=None, verbose=False)
-    other_flat = torch.cat([v.flatten() for v in other["state_dict"].values()])
+    other_flat = _flatten_state_dict(other)
     assert not torch.equal(runs[0][1], other_flat), "different seeds gave identical weights"
     print("seeding: same seed -> bit-identical CPU run, different seed -> different run OK")
 
 
 def test_deterministic_flag_makes_cuda_repeatable():
-    """--deterministic is the only way to get a bit-repeatable GPU run.
+    """Verify --deterministic makes two same-seed CUDA runs bit-identical.
 
-    By default cuDNN uses nondeterministic backward kernels and the autotuner
-    may pick different algorithms per run, so two same-seed CUDA runs drift.
+    Without it, cuDNN's autotuner can pick a different kernel each run.
     """
     import torch
     if not torch.cuda.is_available():
@@ -246,7 +261,7 @@ def test_deterministic_flag_makes_cuda_repeatable():
         _, ck = T.train_model(X, Y, labels, kind="cnn", epochs=8, batch_size=16,
                               seed=7, device="cuda", out_path=None, verbose=False,
                               deterministic=det)
-        return torch.cat([v.flatten() for v in ck["state_dict"].values()]), ck
+        return _flatten_state_dict(ck), ck
 
     a, ck_a = run(True)
     b, _ = run(True)
@@ -262,10 +277,9 @@ def test_deterministic_flag_makes_cuda_repeatable():
 
 
 def test_tf32_default_leaves_torch_settings_alone():
-    """The default must not silently drop matmul mantissa bits.
+    """Verify training does not enable TF32 unless explicitly requested.
 
-    torch ships matmul TF32 OFF; a default of tf32=True would flip it on
-    process-wide and quietly reduce precision under a reproduction baseline.
+    Also verifies the setting is recorded truthfully in run_env.
     """
     import torch
     if not torch.cuda.is_available():
@@ -275,7 +289,7 @@ def test_tf32_default_leaves_torch_settings_alone():
     X, Y, labels = make_separable_dataset(6)
     before = (torch.backends.cudnn.allow_tf32, torch.backends.cuda.matmul.allow_tf32)
     T.train_model(X, Y, labels, kind="cnn", epochs=2, batch_size=16, seed=0,
-                  device="cuda", out_path=None, verbose=False)          # tf32=None
+                  device="cuda", out_path=None, verbose=False)  # tf32=None
     after = (torch.backends.cudnn.allow_tf32, torch.backends.cuda.matmul.allow_tf32)
     assert before == after, f"default run changed TF32 settings: {before} -> {after}"
 
@@ -288,6 +302,7 @@ def test_tf32_default_leaves_torch_settings_alone():
 
 
 def test_training_learns_and_saves_checkpoint():
+    """Verify a short training run learns separable data and saves a checkpoint with the required keys."""
     import torch
     X, Y, labels = make_separable_dataset(3)
     with tempfile.TemporaryDirectory() as tmp:

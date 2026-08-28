@@ -7,7 +7,7 @@ in full and resampled to 48 kHz so the whole pool shares one sample rate
 recording yourself before dropping the .m4a files in.
 
 Recordings are organised by session, one subfolder per recording day, and the
-session structure is MIRRORED from unconverted_raw into converted_wavs:
+session structure is mirrored from unconverted_raw into converted_wavs:
 
     unconverted_raw\day_1\a.m4a   ->   converted_wavs\day_1\a.wav
 
