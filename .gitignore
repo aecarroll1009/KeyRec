@@ -43,6 +43,11 @@ venv/
 # .claude/settings.json, if one is ever added, IS shared and stays tracked.
 .claude/settings.local.json
 
+# Project instructions for Claude Code, kept local -- it has personal/career
+# planning content not meant for the public repo. Still auto-loaded from the
+# repo root when working here; it just isn't tracked.
+/CLAUDE.md
+
 # Editor / OS noise
 .vscode/
 .idea/
