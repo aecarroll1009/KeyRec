@@ -24,26 +24,5 @@ Alex is building a keystroke-inference ML project in three phases.
    EM+acoustic fusion specifically for keystroke inference does not appear to be a heavily
    published combination.
 
-**Load-bearing framing.** A DDC+FFT front-end alone only supports the claim that Alex can
-tape out real DSP silicon — the attack classifies identically whether that DSP runs
-on-chip or in numpy. To make the silicon necessary, the narrative anchors to a
-self-contained, real-time, untethered side-channel appliance that captures EM+acoustic
-and featurizes on-chip, so classification happens live at the edge with no PC in the
-loop.
-
-**CORDIC facts:** rotation mode does NCO/mixer/down-conversion; vectoring mode does
-rect-to-polar (magnitude/phase), and the EM feature path may want both. Gain factor
-K≈1.647 needs correction. Verification approach: use an SDR's own internal DDC output as
-a reference to check the custom CORDIC DDC to within quantization tolerance.
-
-**Front-end build order**, from `cordic_ddc_nco_mixer_datapath.png` in this folder: floor
-(build now) is NCO (phase accumulator → CORDIC in rotation mode, sin/cos) → mixer
-(complex multiply against EM input) → decimating FIR/CIC, where the K≈1.647 gain
-correction is folded in. Stretch (in development) is input mux (EM-path output vs.
-baseband acoustic input) → FFT (folded, single reused butterfly) → magnitude
-(vectoring-mode CORDIC) → mel filterbank → log (hyperbolic-mode CORDIC) → log-mel frames
-out to the ML recognizer.
-
-Current ML progress and the full silicon build-order/verification detail live in
-`CLAUDE.md` and `hardware/DDC_FRONTEND_SCOPE.md`, which are kept current; this file is
-the stable project overview.
+Current ML progress lives in `CLAUDE.md`, which is kept current; this file is the stable
+project overview.
